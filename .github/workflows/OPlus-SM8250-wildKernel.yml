@@ -1,16 +1,16 @@
-name: Build Kernel (SusFS Custom)
+name: Build Kernel (All Variants + SusFS)
 
 on:
   workflow_dispatch:
     inputs:
-      # 1. KernelSU 核心选择
+      # 1. KernelSU 核心选择 (4个全都有了)
       KSU_PROVIDER:
         description: '选择 KernelSU 核心'
         required: true
-        default: 'KernelSU-Next'
+        default: 'FolkPatch'
         type: choice
         options:
-          - 'KernelSU-Next'
+          - 'FolkPatch'
           - 'WildKernels (Official)'
           - 'SukiSU-Ultra'
           - 'rsuntk'
@@ -25,7 +25,7 @@ on:
       SUSFS_VERSION:
         description: '选择 SusFS 版本'
         required: true
-        default: 'v1.5.5'
+        default: 'v2.0'
         type: choice
         options:
           - 'v1.5.5'
@@ -117,34 +117,36 @@ jobs:
         echo "🌿 Branch: ${{ inputs.KERNEL_BRANCH }}"
         git clone --recursive ${{ env.KERNEL_SOURCE }} -b ${{ inputs.KERNEL_BRANCH }} android-kernel --depth=1
 
-    # 1. 注入 KernelSU
+    # 1. 注入 KernelSU (4种全支持)
     - name: Inject KernelSU (${{ inputs.KSU_PROVIDER }})
       run: |
         cd kernel_workspace/android-kernel
         
-        # 为了兼容 SusFS，我们需要知道 KSU 目录确切叫什么
-        # 通常 setup.sh 会自动处理，但我们要标记一下
+        echo "Injecting ${{ inputs.KSU_PROVIDER }}..."
         
-        if [ "${{ inputs.KSU_PROVIDER }}" == "WildKernels (Official)" ]; then
-            curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/main/kernel/setup.sh" | bash -s main
-        elif [ "${{ inputs.KSU_PROVIDER }}" == "KernelSU-Next" ]; then
-            curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+        if [ "${{ inputs.KSU_PROVIDER }}" == "FolkPatch" ]; then
+            # Matsuzaka-Yuki FolkPatch
+            curl -LSs "https://raw.githubusercontent.com/matsuzaka-yuki/FolkPatch/main/kernel/setup.sh" | bash -s main
+
         elif [ "${{ inputs.KSU_PROVIDER }}" == "SukiSU-Ultra" ]; then
+            # ✅ SukiSU-Ultra (加回来了！)
             curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+            
+        elif [ "${{ inputs.KSU_PROVIDER }}" == "WildKernels (Official)" ]; then
+            curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/main/kernel/setup.sh" | bash -s main
+            
         elif [ "${{ inputs.KSU_PROVIDER }}" == "rsuntk" ]; then
             curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh" | bash -s main
         fi
         
         # 寻找 KSU 目录名
-        if [ -d "KernelSU-Next" ]; then
-            echo "KSU_DIR=KernelSU-Next" >> $GITHUB_ENV
-        elif [ -d "KernelSU" ]; then
+        if [ -d "KernelSU" ]; then
             echo "KSU_DIR=KernelSU" >> $GITHUB_ENV
         else
             echo "⚠️ KSU directory not found!"
         fi
 
-    # 2. 注入 SusFS (重点功能)
+    # 2. 注入 SusFS
     - name: Inject SusFS (${{ inputs.SUSFS_VERSION }})
       if: inputs.ENABLE_SUSFS == true
       run: |
@@ -153,25 +155,12 @@ jobs:
         echo "⬇️ Cloning SusFS ${{ inputs.SUSFS_VERSION }}..."
         git clone https://gitlab.com/simonpunk/susfs4ksu.git -b ${{ inputs.SUSFS_VERSION }}
         
-        # 开始应用 SusFS 补丁
-        # 1. 把 SusFS 的代码复制到 KernelSU 目录里 (修改 KSU 源码)
-        # 注意：这里会覆盖 KSU 原有的一些文件，这是正常的
+        # 应用 SusFS
         cd android-kernel
+        # 复制核心文件
         cp -af ../susfs4ksu/ksu/* ${{ env.KSU_DIR }}/
-        
-        # 2. 把 SusFS 的头文件复制到内核 include 目录
+        # 复制头文件
         cp -af ../susfs4ksu/include/linux/* include/linux/
-        
-        # 3. 开启 SusFS 补丁逻辑 (手动应用补丁)
-        # 4.19 内核通常需要 fs/ 补丁。这里尝试自动寻找并应用
-        # 如果自动补丁失败，不要让整个编译挂掉，尝试继续
-        if [ -f "../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch" ]; then
-             # 注意：4.19 和 5.10 结构不同，这里主要依赖 KSU 内部的修改
-             # SusFS 在非 GKI 内核上主要依赖 KSU 内部挂钩，fs patch 可能不兼容
-             echo "⚠️ SusFS on 4.19 relies mostly on KSU modification."
-        fi
-        
-        echo "✅ SusFS injected into ${{ env.KSU_DIR }}"
         
         # 记录版本
         echo "SUSFS_VER=${{ inputs.SUSFS_VERSION }}" >> $GITHUB_ENV
@@ -196,7 +185,6 @@ jobs:
             echo "✅ Enabling SusFS Config..."
             ./scripts/config --file $CONFIG_PATH --enable CONFIG_KSU_SUSFS
             ./scripts/config --file $CONFIG_PATH --enable CONFIG_KSU_SUSFS_SUS_PATH
-            # 开启隐藏相关支持
             ./scripts/config --file $CONFIG_PATH --enable CONFIG_KSU_SUSFS_SUS_MOUNT
             ./scripts/config --file $CONFIG_PATH --enable CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
             ./scripts/config --file $CONFIG_PATH --enable CONFIG_KSU_SUSFS_SUS_KSTAT
@@ -212,7 +200,6 @@ jobs:
         ./scripts/config --file $CONFIG_PATH --enable CONFIG_NETFILTER_XT_TARGET_TTL
         ./scripts/config --file $CONFIG_PATH --enable CONFIG_NETFILTER_XT_TARGET_HL
         
-        # 刷新配置
         make O=out CC=clang \
              CLANG_TRIPLE=aarch64-linux-gnu- \
              CROSS_COMPILE=aarch64-linux-android- \
@@ -281,11 +268,10 @@ jobs:
       run: |
         cd kernel_workspace/AnyKernel3
         
-        CAPTION="🛠 *Custom Kernel Build!*%0A%0A"
+        CAPTION="🛠 *Kernel Build Success!*%0A%0A"
         CAPTION+="🔸 *KSU:* \`${{ inputs.KSU_PROVIDER }}\`%0A"
         CAPTION+="🔸 *SusFS:* \`${{ inputs.SUSFS_VERSION }}\` (Enabled: ${{ inputs.ENABLE_SUSFS }})%0A"
         CAPTION+="🔸 *Manual Hook:* \`${{ inputs.USE_MANUAL_HOOK }}\`%0A"
-        CAPTION+="🔸 *Optimization:* \`LZ4 + BBR\`%0A"
         
         curl -s -F chat_id=$TELEGRAM_CHAT_ID \
              -F document=@${{ env.ZIP_PATH }} \
