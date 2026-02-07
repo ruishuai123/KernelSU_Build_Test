@@ -1,0 +1,198 @@
+name: Build Kernel (WildKernels + Lineage)
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ✅ 新增：把 WildKernels (Official) 加进去了
+      KSU_PROVIDER:
+        description: '选择 KernelSU 版本'
+        required: true
+        default: 'WildKernels (Official)'
+        type: choice
+        options:
+          - 'WildKernels (Official)'
+          - 'KernelSU-Next'
+          - 'rsuntk'
+          - 'Official (tiann)'
+
+      KERNEL_BRANCH:
+        description: 'LineageOS 分支 (如 lineage-22.0 或 23.1)'
+        required: true
+        default: 'lineage-23.1'
+        
+      CLANG_VERSION:
+        description: 'Clang 版本'
+        required: true
+        default: 'clang-r547379'
+        
+      KERNEL_DEFCONFIG:
+        description: '配置文件'
+        required: true
+        default: 'vendor/kona-perf_defconfig'
+
+env:
+  TZ: Asia/Shanghai
+  GCC_TAG: android-12.1.0_r27
+  KERNEL_SOURCE: 'https://github.com/LineageOS/android_kernel_oneplus_sm8250'
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set swap to 10G
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 10
+
+    - name: Setup Environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev
+        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
+
+    - name: Cache Clang
+      id: cache-clang
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/kernel_workspace/clang-aosp
+        key: ${{ inputs.CLANG_VERSION }}
+
+    - name: Download Clang
+      if: steps.cache-clang.outputs.cache-hit != 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        mkdir -p clang-aosp
+        wget -O clang.tar.gz https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${{ inputs.CLANG_VERSION }}.tar.gz
+        tar -C clang-aosp -zxvf clang.tar.gz
+
+    - name: Cache GCC
+      id: cache-gcc
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/kernel_workspace/gcc-64
+        key: gcc-aarch64-${{ env.GCC_TAG }}
+
+    - name: Download GCC
+      if: steps.cache-gcc.outputs.cache-hit != 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        mkdir -p gcc-64
+        wget -O gcc.tar.gz https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${{ env.GCC_TAG }}.tar.gz
+        tar -C gcc-64 -zxvf gcc.tar.gz
+
+    - name: Clone Kernel Source
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        echo "⬇️ Cloning LineageOS Source..."
+        echo "🌿 Branch: ${{ inputs.KERNEL_BRANCH }}"
+        git clone --recursive ${{ env.KERNEL_SOURCE }} -b ${{ inputs.KERNEL_BRANCH }} android-kernel --depth=1
+
+    # 🟢 核心修改：适配 WildKernels/Wild_KSU
+    - name: Inject KernelSU (${{ inputs.KSU_PROVIDER }})
+      run: |
+        cd kernel_workspace/android-kernel
+        
+        echo "Injecting ${{ inputs.KSU_PROVIDER }}..."
+        
+        if [ "${{ inputs.KSU_PROVIDER }}" == "WildKernels (Official)" ]; then
+            # ✅ 这里换成了你指定的仓库
+            curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/main/kernel/setup.sh" | bash -s main
+            KSU_GIT_DIR="KernelSU"
+            
+        elif [ "${{ inputs.KSU_PROVIDER }}" == "KernelSU-Next" ]; then
+            curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+            KSU_GIT_DIR="KernelSU-Next"
+            
+        elif [ "${{ inputs.KSU_PROVIDER }}" == "rsuntk" ]; then
+            curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh" | bash -s main
+            KSU_GIT_DIR="KernelSU"
+            
+        else
+            # Official
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+            KSU_GIT_DIR="KernelSU"
+        fi
+        
+        # 尝试应用通用补丁 (防止编译报错)
+        if [ -f "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" ]; then
+            bash $GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh || true
+        fi
+        
+        # 强制开启 Manual Hook (WildKernels 必须项)
+        echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/${{ inputs.KERNEL_DEFCONFIG }}
+        
+        # 获取版本号
+        if [ -d "KernelSU-Next" ]; then cd KernelSU-Next; else cd KernelSU; fi
+        KSUVER=$(expr $(git rev-list --count HEAD) + 10000)
+        echo "KSUVER=$KSUVER" >> $GITHUB_ENV
+        cd ..
+        
+        sed -i 's/ -dirty//g' scripts/setlocalversion
+
+    - name: Build Kernel
+      run: |
+        cd kernel_workspace/android-kernel
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export BRAND_SHOW_FLAG=oneplus
+        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH
+        
+        make O=out CC=clang \
+             CLANG_TRIPLE=aarch64-linux-gnu- \
+             CROSS_COMPILE=aarch64-linux-android- \
+             LD=ld.lld LLVM=1 LLVM_IAS=1 \
+             ${{ inputs.KERNEL_DEFCONFIG }} vendor/debugfs.config vendor/oplus.config
+             
+        make -j$(nproc --all) O=out CC=clang \
+             CLANG_TRIPLE=aarch64-linux-gnu- \
+             CROSS_COMPILE=aarch64-linux-android- \
+             LD=ld.lld LLVM=1 LLVM_IAS=1
+
+    - name: Package AnyKernel3
+      run: |
+        cd kernel_workspace
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3
+        
+        if [ -f android-kernel/out/arch/arm64/boot/Image ]; then
+            cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
+        else
+            echo "❌ Error: Image not found!"
+            exit 1
+        fi
+        
+        sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+        sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' AnyKernel3/anykernel.sh
+        
+        cd AnyKernel3
+        # 包名加上 Wild 字样，方便区分
+        zip -r AK3-${{ inputs.KERNEL_BRANCH }}-${{ inputs.KSU_PROVIDER }}_${{ env.KSUVER }}.zip ./*
+        echo "ZIP_PATH=$(ls *.zip)" >> $GITHUB_ENV
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Kernel-${{ inputs.KERNEL_BRANCH }}-${{ inputs.KSU_PROVIDER }}
+        path: kernel_workspace/AnyKernel3/*.zip
+
+    - name: 📱 Send to Telegram
+      if: success()
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        cd kernel_workspace/AnyKernel3
+        
+        CAPTION="✅ *Kernel Build Success!*%0A%0A"
+        CAPTION+="🔸 *KSU Variant:* \`${{ inputs.KSU_PROVIDER }}\`%0A"
+        CAPTION+="🔸 *KSU Version:* \`${{ env.KSUVER }}\`%0A"
+        CAPTION+="🔸 *Lineage Branch:* \`${{ inputs.KERNEL_BRANCH }}\`%0A"
+        
+        curl -s -F chat_id=$TELEGRAM_CHAT_ID \
+             -F document=@${{ env.ZIP_PATH }} \
+             -F parse_mode=Markdown \
+             -F caption="$CAPTION" \
+             https://api.telegram.org/bot$TELEGRAM_TOKEN/sendDocument
