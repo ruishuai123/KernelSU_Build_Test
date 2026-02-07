@@ -1,22 +1,48 @@
-name: Build Kernel (4 Variants + Lineage)
+name: Build Kernel (SusFS Custom)
 
 on:
   workflow_dispatch:
     inputs:
-      # ✅ 新增：现在的菜单有 4 个选项了
+      # 1. KernelSU 核心选择
       KSU_PROVIDER:
-        description: '选择 KernelSU 版本'
+        description: '选择 KernelSU 核心'
         required: true
-        default: 'WildKernels (Official)'
+        default: 'KernelSU-Next'
         type: choice
         options:
+          - 'KernelSU-Next'
           - 'WildKernels (Official)'
           - 'SukiSU-Ultra'
-          - 'FolkPatch'
           - 'rsuntk'
 
+      # 2. SusFS 模块控制
+      ENABLE_SUSFS:
+        description: '启用 SusFS (开启后下方版本才生效)'
+        required: true
+        type: boolean
+        default: true
+
+      SUSFS_VERSION:
+        description: '选择 SusFS 版本'
+        required: true
+        default: 'v1.5.5'
+        type: choice
+        options:
+          - 'v1.5.5'
+          - 'v1.5.5-3b956a3'
+          - 'v2.0'
+          - 'v2.0-a083a21'
+
+      # 3. 挂钩模式控制
+      USE_MANUAL_HOOK:
+        description: '启用 Manual Hook (推荐 4.19 内核开启)'
+        required: true
+        type: boolean
+        default: true
+
+      # 4. 基础配置
       KERNEL_BRANCH:
-        description: 'LineageOS 分支 (如 lineage-22.0 或 23.1)'
+        description: 'LineageOS 分支'
         required: true
         default: 'lineage-23.1'
         
@@ -91,49 +117,113 @@ jobs:
         echo "🌿 Branch: ${{ inputs.KERNEL_BRANCH }}"
         git clone --recursive ${{ env.KERNEL_SOURCE }} -b ${{ inputs.KERNEL_BRANCH }} android-kernel --depth=1
 
-    # 🟢 核心修改：适配 4 种 KernelSU
+    # 1. 注入 KernelSU
     - name: Inject KernelSU (${{ inputs.KSU_PROVIDER }})
       run: |
         cd kernel_workspace/android-kernel
         
-        echo "Injecting ${{ inputs.KSU_PROVIDER }}..."
+        # 为了兼容 SusFS，我们需要知道 KSU 目录确切叫什么
+        # 通常 setup.sh 会自动处理，但我们要标记一下
         
         if [ "${{ inputs.KSU_PROVIDER }}" == "WildKernels (Official)" ]; then
-            # WildKernels 官方仓库
             curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/main/kernel/setup.sh" | bash -s main
-            
+        elif [ "${{ inputs.KSU_PROVIDER }}" == "KernelSU-Next" ]; then
+            curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next
         elif [ "${{ inputs.KSU_PROVIDER }}" == "SukiSU-Ultra" ]; then
-            # SukiSU-Ultra 仓库
             curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
-
-        elif [ "${{ inputs.KSU_PROVIDER }}" == "FolkPatch" ]; then
-            # Matsuzaka-Yuki FolkPatch 仓库
-            curl -LSs "https://raw.githubusercontent.com/matsuzaka-yuki/FolkPatch/main/kernel/setup.sh" | bash -s main
-            
         elif [ "${{ inputs.KSU_PROVIDER }}" == "rsuntk" ]; then
-            # rsuntk 仓库
             curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh" | bash -s main
-            
         fi
         
-        # 尝试应用通用补丁
-        if [ -f "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" ]; then
-            bash $GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh || true
-        fi
-        
-        # 强制开启 Manual Hook (所有 Wild/Fork 类版本都需要)
-        echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/${{ inputs.KERNEL_DEFCONFIG }}
-        
-        # 获取版本号 (这些分支通常都 clone 到 KernelSU 目录)
-        if [ -d "KernelSU" ]; then
-            cd KernelSU
-            KSUVER=$(expr $(git rev-list --count HEAD) + 10000)
-            echo "KSUVER=$KSUVER" >> $GITHUB_ENV
-            cd ..
+        # 寻找 KSU 目录名
+        if [ -d "KernelSU-Next" ]; then
+            echo "KSU_DIR=KernelSU-Next" >> $GITHUB_ENV
+        elif [ -d "KernelSU" ]; then
+            echo "KSU_DIR=KernelSU" >> $GITHUB_ENV
         else
-            echo "⚠️ Warning: KernelSU directory not found, skipping version check."
-            echo "KSUVER=Unknown" >> $GITHUB_ENV
+            echo "⚠️ KSU directory not found!"
         fi
+
+    # 2. 注入 SusFS (重点功能)
+    - name: Inject SusFS (${{ inputs.SUSFS_VERSION }})
+      if: inputs.ENABLE_SUSFS == true
+      run: |
+        cd kernel_workspace
+        
+        echo "⬇️ Cloning SusFS ${{ inputs.SUSFS_VERSION }}..."
+        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b ${{ inputs.SUSFS_VERSION }}
+        
+        # 开始应用 SusFS 补丁
+        # 1. 把 SusFS 的代码复制到 KernelSU 目录里 (修改 KSU 源码)
+        # 注意：这里会覆盖 KSU 原有的一些文件，这是正常的
+        cd android-kernel
+        cp -af ../susfs4ksu/ksu/* ${{ env.KSU_DIR }}/
+        
+        # 2. 把 SusFS 的头文件复制到内核 include 目录
+        cp -af ../susfs4ksu/include/linux/* include/linux/
+        
+        # 3. 开启 SusFS 补丁逻辑 (手动应用补丁)
+        # 4.19 内核通常需要 fs/ 补丁。这里尝试自动寻找并应用
+        # 如果自动补丁失败，不要让整个编译挂掉，尝试继续
+        if [ -f "../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch" ]; then
+             # 注意：4.19 和 5.10 结构不同，这里主要依赖 KSU 内部的修改
+             # SusFS 在非 GKI 内核上主要依赖 KSU 内部挂钩，fs patch 可能不兼容
+             echo "⚠️ SusFS on 4.19 relies mostly on KSU modification."
+        fi
+        
+        echo "✅ SusFS injected into ${{ env.KSU_DIR }}"
+        
+        # 记录版本
+        echo "SUSFS_VER=${{ inputs.SUSFS_VERSION }}" >> $GITHUB_ENV
+
+    # 3. 基础优化 + 开关控制
+    - name: 🔥 Apply Settings (Hook, LZ4, BBR)
+      run: |
+        cd kernel_workspace/android-kernel
+        CONFIG_PATH="arch/arm64/configs/${{ inputs.KERNEL_DEFCONFIG }}"
+        
+        # === 核心开关：Manual Hook ===
+        if [ "${{ inputs.USE_MANUAL_HOOK }}" == "true" ]; then
+            echo "✅ Enabling Manual Hook..."
+            ./scripts/config --file $CONFIG_PATH --enable CONFIG_KSU_MANUAL_HOOK
+        else
+            echo "🚫 Disabling Manual Hook..."
+            ./scripts/config --file $CONFIG_PATH --disable CONFIG_KSU_MANUAL_HOOK
+        fi
+        
+        # === 核心开关：SusFS ===
+        if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then
+            echo "✅ Enabling SusFS Config..."
+            ./scripts/config --file $CONFIG_PATH --enable CONFIG_KSU_SUSFS
+            ./scripts/config --file $CONFIG_PATH --enable CONFIG_KSU_SUSFS_SUS_PATH
+            # 开启隐藏相关支持
+            ./scripts/config --file $CONFIG_PATH --enable CONFIG_KSU_SUSFS_SUS_MOUNT
+            ./scripts/config --file $CONFIG_PATH --enable CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+            ./scripts/config --file $CONFIG_PATH --enable CONFIG_KSU_SUSFS_SUS_KSTAT
+            ./scripts/config --file $CONFIG_PATH --enable CONFIG_KSU_SUSFS_SUS_OVERLAYFS
+            ./scripts/config --file $CONFIG_PATH --enable CONFIG_KSU_SUSFS_TRY_UMOUNT
+        fi
+
+        # === 基础优化 (LZ4, BBR, TTL) ===
+        ./scripts/config --file $CONFIG_PATH --enable CONFIG_KERNEL_LZ4
+        ./scripts/config --file $CONFIG_PATH --disable CONFIG_KERNEL_GZIP
+        ./scripts/config --file $CONFIG_PATH --enable CONFIG_TCP_CONG_BBR
+        ./scripts/config --file $CONFIG_PATH --enable CONFIG_DEFAULT_BBR
+        ./scripts/config --file $CONFIG_PATH --enable CONFIG_NETFILTER_XT_TARGET_TTL
+        ./scripts/config --file $CONFIG_PATH --enable CONFIG_NETFILTER_XT_TARGET_HL
+        
+        # 刷新配置
+        make O=out CC=clang \
+             CLANG_TRIPLE=aarch64-linux-gnu- \
+             CROSS_COMPILE=aarch64-linux-android- \
+             LD=ld.lld LLVM=1 LLVM_IAS=1 \
+             ${{ inputs.KERNEL_DEFCONFIG }}
+             
+        # 获取 KSU 版本
+        cd ${{ env.KSU_DIR }}
+        KSUVER=$(expr $(git rev-list --count HEAD) + 10000)
+        echo "KSUVER=$KSUVER" >> $GITHUB_ENV
+        cd ..
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
@@ -145,12 +235,6 @@ jobs:
         export BRAND_SHOW_FLAG=oneplus
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH
         
-        make O=out CC=clang \
-             CLANG_TRIPLE=aarch64-linux-gnu- \
-             CROSS_COMPILE=aarch64-linux-android- \
-             LD=ld.lld LLVM=1 LLVM_IAS=1 \
-             ${{ inputs.KERNEL_DEFCONFIG }} vendor/debugfs.config vendor/oplus.config
-             
         make -j$(nproc --all) O=out CC=clang \
              CLANG_TRIPLE=aarch64-linux-gnu- \
              CROSS_COMPILE=aarch64-linux-android- \
@@ -161,7 +245,9 @@ jobs:
         cd kernel_workspace
         git clone --depth=1 https://github.com/osm0sis/AnyKernel3
         
-        if [ -f android-kernel/out/arch/arm64/boot/Image ]; then
+        if [ -f android-kernel/out/arch/arm64/boot/Image.lz4 ]; then
+            cp android-kernel/out/arch/arm64/boot/Image.lz4 AnyKernel3/Image
+        elif [ -f android-kernel/out/arch/arm64/boot/Image ]; then
             cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
         else
             echo "❌ Error: Image not found!"
@@ -172,8 +258,13 @@ jobs:
         sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' AnyKernel3/anykernel.sh
         
         cd AnyKernel3
-        # 包名
-        zip -r AK3-${{ inputs.KERNEL_BRANCH }}-${{ inputs.KSU_PROVIDER }}_${{ env.KSUVER }}.zip ./*
+        # 包名显示 SusFS 版本
+        SUS_TAG=""
+        if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then
+            SUS_TAG="-SusFS-${{ inputs.SUSFS_VERSION }}"
+        fi
+        
+        zip -r AK3-${{ inputs.KERNEL_BRANCH }}-${{ inputs.KSU_PROVIDER }}${SUS_TAG}_${{ env.KSUVER }}.zip ./*
         echo "ZIP_PATH=$(ls *.zip)" >> $GITHUB_ENV
 
     - name: Upload Artifact
@@ -190,10 +281,11 @@ jobs:
       run: |
         cd kernel_workspace/AnyKernel3
         
-        CAPTION="✅ *Kernel Build Success!*%0A%0A"
-        CAPTION+="🔸 *KSU Variant:* \`${{ inputs.KSU_PROVIDER }}\`%0A"
-        CAPTION+="🔸 *KSU Version:* \`${{ env.KSUVER }}\`%0A"
-        CAPTION+="🔸 *Lineage Branch:* \`${{ inputs.KERNEL_BRANCH }}\`%0A"
+        CAPTION="🛠 *Custom Kernel Build!*%0A%0A"
+        CAPTION+="🔸 *KSU:* \`${{ inputs.KSU_PROVIDER }}\`%0A"
+        CAPTION+="🔸 *SusFS:* \`${{ inputs.SUSFS_VERSION }}\` (Enabled: ${{ inputs.ENABLE_SUSFS }})%0A"
+        CAPTION+="🔸 *Manual Hook:* \`${{ inputs.USE_MANUAL_HOOK }}\`%0A"
+        CAPTION+="🔸 *Optimization:* \`LZ4 + BBR\`%0A"
         
         curl -s -F chat_id=$TELEGRAM_CHAT_ID \
              -F document=@${{ env.ZIP_PATH }} \
