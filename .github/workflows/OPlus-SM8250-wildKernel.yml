@@ -1,9 +1,9 @@
-name: Build Kernel (WildKernels + Lineage)
+name: Build Kernel (4 Variants + Lineage)
 
 on:
   workflow_dispatch:
     inputs:
-      # ✅ 新增：把 WildKernels (Official) 加进去了
+      # ✅ 新增：现在的菜单有 4 个选项了
       KSU_PROVIDER:
         description: '选择 KernelSU 版本'
         required: true
@@ -11,9 +11,9 @@ on:
         type: choice
         options:
           - 'WildKernels (Official)'
-          - 'KernelSU-Next'
+          - 'SukiSU-Ultra'
+          - 'FolkPatch'
           - 'rsuntk'
-          - 'Official (tiann)'
 
       KERNEL_BRANCH:
         description: 'LineageOS 分支 (如 lineage-22.0 或 23.1)'
@@ -91,7 +91,7 @@ jobs:
         echo "🌿 Branch: ${{ inputs.KERNEL_BRANCH }}"
         git clone --recursive ${{ env.KERNEL_SOURCE }} -b ${{ inputs.KERNEL_BRANCH }} android-kernel --depth=1
 
-    # 🟢 核心修改：适配 WildKernels/Wild_KSU
+    # 🟢 核心修改：适配 4 种 KernelSU
     - name: Inject KernelSU (${{ inputs.KSU_PROVIDER }})
       run: |
         cd kernel_workspace/android-kernel
@@ -99,37 +99,41 @@ jobs:
         echo "Injecting ${{ inputs.KSU_PROVIDER }}..."
         
         if [ "${{ inputs.KSU_PROVIDER }}" == "WildKernels (Official)" ]; then
-            # ✅ 这里换成了你指定的仓库
+            # WildKernels 官方仓库
             curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/main/kernel/setup.sh" | bash -s main
-            KSU_GIT_DIR="KernelSU"
             
-        elif [ "${{ inputs.KSU_PROVIDER }}" == "KernelSU-Next" ]; then
-            curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next
-            KSU_GIT_DIR="KernelSU-Next"
+        elif [ "${{ inputs.KSU_PROVIDER }}" == "SukiSU-Ultra" ]; then
+            # SukiSU-Ultra 仓库
+            curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+
+        elif [ "${{ inputs.KSU_PROVIDER }}" == "FolkPatch" ]; then
+            # Matsuzaka-Yuki FolkPatch 仓库
+            curl -LSs "https://raw.githubusercontent.com/matsuzaka-yuki/FolkPatch/main/kernel/setup.sh" | bash -s main
             
         elif [ "${{ inputs.KSU_PROVIDER }}" == "rsuntk" ]; then
+            # rsuntk 仓库
             curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh" | bash -s main
-            KSU_GIT_DIR="KernelSU"
             
-        else
-            # Official
-            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
-            KSU_GIT_DIR="KernelSU"
         fi
         
-        # 尝试应用通用补丁 (防止编译报错)
+        # 尝试应用通用补丁
         if [ -f "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" ]; then
             bash $GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh || true
         fi
         
-        # 强制开启 Manual Hook (WildKernels 必须项)
+        # 强制开启 Manual Hook (所有 Wild/Fork 类版本都需要)
         echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/${{ inputs.KERNEL_DEFCONFIG }}
         
-        # 获取版本号
-        if [ -d "KernelSU-Next" ]; then cd KernelSU-Next; else cd KernelSU; fi
-        KSUVER=$(expr $(git rev-list --count HEAD) + 10000)
-        echo "KSUVER=$KSUVER" >> $GITHUB_ENV
-        cd ..
+        # 获取版本号 (这些分支通常都 clone 到 KernelSU 目录)
+        if [ -d "KernelSU" ]; then
+            cd KernelSU
+            KSUVER=$(expr $(git rev-list --count HEAD) + 10000)
+            echo "KSUVER=$KSUVER" >> $GITHUB_ENV
+            cd ..
+        else
+            echo "⚠️ Warning: KernelSU directory not found, skipping version check."
+            echo "KSUVER=Unknown" >> $GITHUB_ENV
+        fi
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
@@ -168,7 +172,7 @@ jobs:
         sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' AnyKernel3/anykernel.sh
         
         cd AnyKernel3
-        # 包名加上 Wild 字样，方便区分
+        # 包名
         zip -r AK3-${{ inputs.KERNEL_BRANCH }}-${{ inputs.KSU_PROVIDER }}_${{ env.KSUVER }}.zip ./*
         echo "ZIP_PATH=$(ls *.zip)" >> $GITHUB_ENV
 
