@@ -10,7 +10,7 @@ on:
       
       # ✅ 新增：SusFS 功能开关
       ENABLE_SUSFS:
-        description: '启用 SusFS (kernel-4.19 分支)'
+        description: '启用 SusFS v1.5.5 (稳定版)'
         required: true
         type: boolean
         default: true
@@ -96,27 +96,29 @@ jobs:
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    # ✅ 修正：使用 kernel-4.19 分支
+    # ✅ 修复：使用绝对路径注入 SusFS，避免路径错误
     - name: Inject SusFS (kernel-4.19)
       if: inputs.ENABLE_SUSFS == true
       run: |
         cd kernel_workspace
         echo "⬇️ Cloning SusFS (kernel-4.19 branch)..."
-        # 修正：使用你指定的 kernel-4.19 分支
         git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
         
+        # 1. 获取 SusFS 的绝对路径 (关键修复点)
+        SUSFS_DIR="$(pwd)/susfs4ksu"
+        echo "✅ SusFS directory located at: $SUSFS_DIR"
+        
+        # 2. 进入内核目录
         cd android-kernel
         
-        # 1. 将 SusFS 的修改应用到 KernelSU 目录
+        # 3. 复制文件 (使用绝对路径，确保万无一失)
         echo "📋 Copying SusFS modifications to KernelSU..."
-        # 注意：4.19 分支的目录结构可能略有不同，这里确保覆盖
-        cp -af ../susfs4ksu/ksu/* KernelSU/
+        cp -af "${SUSFS_DIR}/ksu/"* KernelSU/
         
-        # 2. 复制内核头文件
         echo "📋 Copying kernel headers..."
-        cp -af ../susfs4ksu/include/linux/* include/linux/
+        cp -af "${SUSFS_DIR}/include/linux/"* include/linux/
         
-        # 3. 开启 SusFS 配置
+        # 4. 开启 SusFS 配置
         CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
         
         echo "🔧 Enabling SusFS Configs..."
