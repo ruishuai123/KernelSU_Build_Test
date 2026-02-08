@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       LINEAGE_BRANCH:
-        description: 'LineageOS 分支 (例如 lineage-21.0)'
+        description: 'LineageOS 分支 (例如 lineage-23.0)'
         required: true
-        default: 'lineage-21.0'
+        default: 'lineage-23.0'
       
       # ✅ 新增：SusFS 功能开关
       ENABLE_SUSFS:
