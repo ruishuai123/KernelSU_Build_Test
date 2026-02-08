@@ -1,28 +1,18 @@
-name: Build OnePlus 8 Kernel (Custom UI)
+name: Build LineageOS Kernel (rsuntk Only)
 
 on:
   workflow_dispatch:
     inputs:
-      KERNEL_SOURCE:
-        description: '内核源码地址 (Source URL)'
+      LINEAGE_BRANCH:
+        description: 'LineageOS 分支 (例如 lineage-23.0)'
         required: true
-        default: 'https://github.com/LineageOS/android_kernel_oneplus_sm8250'
-      KERNEL_BRANCH:
-        description: '内核分支 (Branch)'
-        required: true
-        default: 'lineage-23.1'
-      KERNEL_DEFCONFIG:
-        description: '配置文件 (Defconfig)'
-        required: true
-        default: 'vendor/kona-perf_defconfig'
-      CLANG_VERSION:
-        description: 'Clang 版本 (如 clang-r547379)'
-        required: true
-        default: 'clang-r547379'
+        default: 'lineage-23.0'
 
 env:
   TZ: Asia/Shanghai
+  CLANG_VERSION: clang-r547379
   GCC_TAG: android-12.1.0_r27
+  # 移除全局写死的 Lineage_VERSION，改用 inputs
 
 jobs:
   build:
@@ -37,115 +27,134 @@ jobs:
       with:
         swap-size-gb: 10
 
-    - name: Setup Environment
+    - name: Setup build kernel environment
       run: |
         echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> $GITHUB_ENV
+        echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> $GITHUB_ENV
         sudo apt-get update
         sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
 
-    - name: Cache Clang
+    - name: Cache Clang toolchain
       id: cache-clang
       uses: actions/cache@v4
       with:
         path: ${{ github.workspace }}/kernel_workspace/clang-aosp
-        key: ${{ inputs.CLANG_VERSION }}
+        key: ${{ env.CLANG_VERSION }}
 
-    - name: Download Clang (If not cached)
+    - name: Download & extract Clang-aosp (if cache miss)
       if: steps.cache-clang.outputs.cache-hit != 'true'
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
         mkdir -p clang-aosp
-        wget -O clang.tar.gz https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${{ inputs.CLANG_VERSION }}.tar.gz
-        tar -C clang-aosp -zxvf clang.tar.gz
+        wget -O ${CLANG_VERSION}.tar.gz \
+          https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz
+        tar -C clang-aosp -zxvf ${CLANG_VERSION}.tar.gz
 
-    - name: Cache GCC
+    - name: Cache GCC toolchain
       id: cache-gcc
       uses: actions/cache@v4
       with:
         path: ${{ github.workspace }}/kernel_workspace/gcc-64
         key: gcc-aarch64-${{ env.GCC_TAG }}
 
-    - name: Download GCC (If not cached)
+    - name: Download & extract Gcc-aosp (if cache miss)
       if: steps.cache-gcc.outputs.cache-hit != 'true'
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
         mkdir -p gcc-64
-        wget -O gcc.tar.gz https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${{ env.GCC_TAG }}.tar.gz
-        tar -C gcc-64 -zxvf gcc.tar.gz
+        wget -O gcc-aarch64.tar.gz \
+          https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz
+        tar -C gcc-64 -zxvf gcc-aarch64.tar.gz
 
-    - name: Clone Kernel Source
+    - name: Download kernel source
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
-        echo "Cloning: ${{ inputs.KERNEL_SOURCE }}"
-        echo "Branch: ${{ inputs.KERNEL_BRANCH }}"
-        git clone --recursive ${{ inputs.KERNEL_SOURCE }} -b ${{ inputs.KERNEL_BRANCH }} android-kernel --depth=1
+        # 这里使用了 UI 输入的分支
+        git clone --recursive https://github.com/LineageOS/android_kernel_oneplus_sm8250 -b ${{ inputs.LINEAGE_BRANCH }} android-kernel --depth=1
 
-    - name: Inject KernelSU (rsuntk only)
+    - name: Set up KernelSU (rsuntk)
       run: |
         cd kernel_workspace/android-kernel
-        
-        # 下载 rsuntk 版 KernelSU
+
         curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s main
-        
-        # 尝试打补丁 (如果仓库里有 patches 文件夹的话)
-        if [ -f "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" ]; then
-            bash $GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh || true
-        fi
-        
-        # 开启 Manual Hook
-        echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/${{ inputs.KERNEL_DEFCONFIG }}
-        
-        # 获取 KSU 版本号用于命名
+        bash $GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh || true
+        echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/vendor/kona-perf_defconfig
         RSKSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
         echo "RSKSUVER=$RSKSUVER" >> $GITHUB_ENV
-        
-        # 清除 dirty 标记
+
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    - name: Build Kernel
+    - name: Build kernel
       run: |
         cd kernel_workspace/android-kernel
         export ARCH=arm64
         export SUBARCH=arm64
         export BRAND_SHOW_FLAG=oneplus
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH
-        
-        # 核心编译命令
-        make O=out CC=clang \
-             CLANG_TRIPLE=aarch64-linux-gnu- \
-             CROSS_COMPILE=aarch64-linux-android- \
-             LD=ld.lld LLVM=1 LLVM_IAS=1 \
-             ${{ inputs.KERNEL_DEFCONFIG }} vendor/debugfs.config vendor/oplus.config
-             
-        make -j$(nproc --all) O=out CC=clang \
-             CLANG_TRIPLE=aarch64-linux-gnu- \
-             CROSS_COMPILE=aarch64-linux-android- \
-             LD=ld.lld LLVM=1 LLVM_IAS=1
+        export KBUILD_BUILD_HOST=Github-Action
+        export KBUILD_BUILD_USER=$(echo ${{ github.actor }} | tr A-Z a-z)
 
-    - name: Package AnyKernel3
+        BA_CMD="CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-"
+        EX_CMD="LD=ld.lld LLVM=1 LLVM_IAS=1"
+        DEFCONFIG="vendor/kona-perf_defconfig vendor/debugfs.config vendor/oplus.config"
+
+        make O=out CC=clang $BA_CMD $EX_CMD $DEFCONFIG
+        make -j$(nproc --all) O=out CC=clang $BA_CMD $EX_CMD
+
+    - name: Check kernel output
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel/out
+
+        if [ -f arch/arm64/boot/Image ]; then
+          echo "CHECK_IMAGE=true" >> $GITHUB_ENV
+          echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> $GITHUB_ENV
+        else
+          echo "Kernel output file is empty"
+          exit 1
+        fi
+
+    - name: Prepare AnyKernel3 and package
       run: |
         cd kernel_workspace
         git clone --depth=1 https://github.com/osm0sis/AnyKernel3
-        
-        # 检查 Image 是否生成
-        if [ -f android-kernel/out/arch/arm64/boot/Image ]; then
-            cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
-        else
-            echo "❌ Error: Image not found!"
-            exit 1
-        fi
-        
-        # 去除机型验证，改为自动模式
         sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+        sed -i 's!BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!BLOCK=auto;!g' AnyKernel3/anykernel.sh
         sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' AnyKernel3/anykernel.sh
-        
-        # 打包
-        cd AnyKernel3
-        zip -r AK3-${{ inputs.KERNEL_BRANCH }}-rsuntk_KSU_${{ env.RSKSUVER }}.zip ./*
+        rm -rf AnyKernel3/.git* AnyKernel3/README.md
+        cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
 
-    - name: Upload Artifact
+        cd AnyKernel3
+        zip -r AK3-${{ inputs.LINEAGE_BRANCH }}-OPlus-SM8250-rsuntk_KSU_${{ env.RSKSUVER }}.zip ./*
+        
+        # 将生成的 ZIP 文件名保存到变量，方便发送
+        echo "ZIP_NAME=$(ls *.zip)" >> $GITHUB_ENV
+
+    - name: Upload AnyKernel3 ZIP (GitHub Artifact)
       uses: actions/upload-artifact@v4
       with:
-        name: Kernel-${{ inputs.KERNEL_BRANCH }}-rsuntk
+        name: AK3-rsuntk
         path: kernel_workspace/AnyKernel3/*.zip
+
+    - name: Send to Telegram Bot
+      if: success()
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }} # 注意这里改成了 CHAT_ID
+      run: |
+        cd kernel_workspace/AnyKernel3
+        
+        # 构建消息文案
+        CAPTION="✅ *Kernel Build Success!*%0A%0A"
+        CAPTION+="🔸 *Branch:* \`${{ inputs.LINEAGE_BRANCH }}\`%0A"
+        CAPTION+="🔸 *Kernel Version:* \`${{ env.KERNEL_VERSION }}\`%0A"
+        CAPTION+="🔸 *KSU Version:* \`${{ env.RSKSUVER }}\`%0A"
+        CAPTION+="🔸 *Build Time:* \`${{ env.BUILD_TIME_1 }}\`%0A"
+        
+        # 发送文件给你的 Bot
+        # 注意：这里直接发送给你的个人 Chat ID，不再用 sendMediaGroup
+        curl -s -F chat_id=$TELEGRAM_CHAT_ID \
+             -F document=@${{ env.ZIP_NAME }} \
+             -F parse_mode=Markdown \
+             -F caption="$CAPTION" \
+             https://api.telegram.org/bot$TELEGRAM_TOKEN/sendDocument
