@@ -1,4 +1,4 @@
-name: Build LineageOS Kernel (Optimized)
+name: Build LineageOS Kernel (rsuntk + SusFS)
 
 on:
   workflow_dispatch:
@@ -144,7 +144,7 @@ jobs:
         echo "SUSFS_VERSION=kernel-4.19" >> $GITHUB_ENV
         echo "✅ SusFS injection process completed."
 
-    # ✅ 新增：注入内核优化扩展 (LSM/NETFILTER/BBR/ZRAM)
+    # ✅ 注入内核优化扩展 (修复 ZRAM LZ4 依赖)
     - name: Inject Kernel Extensions
       run: |
         cd kernel_workspace/android-kernel
@@ -175,12 +175,16 @@ jobs:
             echo "CONFIG_TCP_ECN=y" >> $CONFIG_FILE
         fi
         
-        # 4. ZRAM (LZ4)
+        # 4. ZRAM (LZ4) - 修复依赖缺失导致的 Error 2
         if [ "${{ inputs.ENABLE_ZRAM }}" == "true" ]; then
-            echo "💾 Enabling ZRAM LZ4..."
+            echo "💾 Enabling ZRAM LZ4 with dependencies..."
             echo "CONFIG_ZRAM=y" >> $CONFIG_FILE
-            echo "CONFIG_CRYPTO_LZ4=y" >> $CONFIG_FILE
             echo "CONFIG_ZRAM_WRITEBACK=y" >> $CONFIG_FILE
+            # 修复：补充 LZ4 底层库配置，防止符号丢失
+            echo "CONFIG_LZ4_COMPRESS=y" >> $CONFIG_FILE
+            echo "CONFIG_LZ4_DECOMPRESS=y" >> $CONFIG_FILE
+            echo "CONFIG_LZ4HC_COMPRESS=y" >> $CONFIG_FILE
+            echo "CONFIG_CRYPTO_LZ4=y" >> $CONFIG_FILE
         fi
 
     - name: Build kernel
@@ -257,6 +261,7 @@ jobs:
         if [ "${{ inputs.ENABLE_LSM }}" == "true" ]; then CAPTION+="🔹 *LSM/BBG:* ✅%0A"; else CAPTION+="🔹 *LSM/BBG:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_NETFILTER }}" == "true" ]; then CAPTION+="🔹 *Netfilter:* ✅%0A"; else CAPTION+="🔹 *Netfilter:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_BBR }}" == "true" ]; then CAPTION+="🔹 *BBR+ECN:* ✅%0A"; else CAPTION+="🔹 *BBR+ECN:* ❌%0A"; fi
+        if [ "${{ inputs.ENABLE_ZRAM }}" == "true" ]; then CAPTION+="🔹 *ZRAM (LZ4):* ✅%0A"; else CAPTION+="🔹 *ZRAM:* ❌%0A"; fi
         
         curl -s -F chat_id=$TELEGRAM_CHAT_ID \
              -F document=@${{ env.ZIP_NAME }} \
