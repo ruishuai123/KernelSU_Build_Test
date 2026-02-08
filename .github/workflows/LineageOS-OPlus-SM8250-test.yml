@@ -9,7 +9,7 @@ on:
         default: 'lineage-23.0'
       
       ENABLE_SUSFS:
-        description: '启用 SusFS (kernel-4.19 分支)'
+        description: '启用 SusFS v1.5.5 (稳定版)'
         required: true
         type: boolean
         default: true
@@ -89,7 +89,7 @@ jobs:
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    # ✅ 修复：兼容不同的 SusFS 目录结构
+    # ✅ 简化版：直接拷贝 kernel_patches (基于你的成功日志)
     - name: Inject SusFS (kernel-4.19)
       if: inputs.ENABLE_SUSFS == true
       run: |
@@ -97,31 +97,16 @@ jobs:
         echo "⬇️ Cloning SusFS (kernel-4.19 branch)..."
         git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
         
-        # 获取绝对路径，防止路径错误
         SUSFS_DIR="$(pwd)/susfs4ksu"
         
         cd android-kernel
         
-        # 1. 尝试复制 KernelSU 补丁 (兼容两种结构)
-        if [ -d "${SUSFS_DIR}/ksu" ]; then
-            echo "📋 Copying ksu/ modifications..."
-            cp -af "${SUSFS_DIR}/ksu/"* KernelSU/
-        else
-            echo "⚠️ 'ksu' directory not found, checking kernel_patches..."
-        fi
-
-        # 2. 尝试复制 fs/ 和 include/ (这是 4.19 分支常见结构)
-        if [ -d "${SUSFS_DIR}/kernel_patches/fs" ]; then
-            echo "📋 Copying fs/ modifications from kernel_patches..."
-            cp -af "${SUSFS_DIR}/kernel_patches/fs/"* fs/
-            cp -af "${SUSFS_DIR}/kernel_patches/include/linux/"* include/linux/
-        elif [ -d "${SUSFS_DIR}/fs" ]; then
-             echo "📋 Copying fs/ modifications from root..."
-             cp -af "${SUSFS_DIR}/fs/"* fs/
-             cp -af "${SUSFS_DIR}/include/linux/"* include/linux/
-        fi
+        # 1. 直接从 kernel_patches 目录复制文件 (去掉了无关的 ksu 检查)
+        echo "📋 Copying SusFS files from kernel_patches..."
+        cp -af "${SUSFS_DIR}/kernel_patches/fs/"* fs/
+        cp -af "${SUSFS_DIR}/kernel_patches/include/linux/"* include/linux/
         
-        # 3. 开启 SusFS 配置
+        # 2. 开启 SusFS 配置
         CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
         echo "🔧 Enabling SusFS Configs..."
         echo "CONFIG_KSU_SUSFS=y" >> $CONFIG_FILE
