@@ -1,1 +1,218 @@
+name: Build LineageOS Kernel (rsuntk + SusFS)
 
+on:
+  workflow_dispatch:
+    inputs:
+      LINEAGE_BRANCH:
+        description: 'LineageOS 分支 (例如 lineage-23.0)'
+        required: true
+        default: 'lineage-23.0'
+      
+      # Added Mode Selection
+      KSU_MODE:
+        description: 'KernelSU Mode'
+        required: true
+        type: choice
+        default: 'rsuntk'
+        options:
+          - 'rsuntk'
+          - 'SukiSU-ultra'
+
+      ENABLE_SUSFS:
+        description: '启用 SusFS v1.5.5 (稳定版)'
+        required: true
+        type: boolean
+        default: true
+
+env:
+  TZ: Asia/Shanghai
+  CLANG_VERSION: clang-r547379
+  GCC_TAG: android-12.1.0_r27
+
+jobs:
+  build:
+    name: Build Kernel (${{ inputs.KSU_MODE }})
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set swap to 10G
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 10
+
+    - name: Setup build kernel environment
+      run: |
+        echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> $GITHUB_ENV
+        echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> $GITHUB_ENV
+        sudo apt-get update
+        sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev
+        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
+
+    - name: Cache Clang toolchain
+      id: cache-clang
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/kernel_workspace/clang-aosp
+        key: ${{ env.CLANG_VERSION }}
+
+    - name: Download & extract Clang-aosp (if cache miss)
+      if: steps.cache-clang.outputs.cache-hit != 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        mkdir -p clang-aosp
+        wget -O ${CLANG_VERSION}.tar.gz \
+          https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz
+        tar -C clang-aosp -zxvf ${CLANG_VERSION}.tar.gz
+
+    - name: Cache GCC toolchain
+      id: cache-gcc
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/kernel_workspace/gcc-64
+        key: gcc-aarch64-${{ env.GCC_TAG }}
+
+    - name: Download & extract Gcc-aosp (if cache miss)
+      if: steps.cache-gcc.outputs.cache-hit != 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        mkdir -p gcc-64
+        wget -O gcc-aarch64.tar.gz \
+          https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz
+        tar -C gcc-64 -zxvf gcc-aarch64.tar.gz
+
+    - name: Download kernel source
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        git clone --recursive https://github.com/LineageOS/android_kernel_oneplus_sm8250 -b ${{ inputs.LINEAGE_BRANCH }} android-kernel --depth=1
+
+    - name: Set up KernelSU
+      run: |
+        cd kernel_workspace/android-kernel
+
+        if [ "${{ inputs.KSU_MODE }}" = "rsuntk" ]; then
+          echo "Setting up rsuntk KernelSU..."
+          curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s main
+        elif [ "${{ inputs.KSU_MODE }}" = "SukiSU-ultra" ]; then
+          echo "Setting up SukiSU-ultra..."
+          curl -LSs https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh | bash -s main
+        fi
+
+        bash $GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh || true
+        echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/vendor/kona-perf_defconfig
+        RSKSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
+        echo "RSKSUVER=$RSKSUVER" >> $GITHUB_ENV
+        
+        sed -i 's/ -dirty//g' scripts/setlocalversion
+
+    - name: Inject SusFS (kernel-4.19)
+      if: inputs.ENABLE_SUSFS == true
+      run: |
+        cd kernel_workspace
+        echo "⬇️ Cloning SusFS (kernel-4.19 branch)..."
+        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
+        
+        SUSFS_DIR="$(pwd)/susfs4ksu"
+        
+        cd android-kernel
+        
+        echo "📋 Copying SusFS files from kernel_patches..."
+        cp -af "${SUSFS_DIR}/kernel_patches/fs/"* fs/
+        cp -af "${SUSFS_DIR}/kernel_patches/include/linux/"* include/linux/
+        
+        CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
+        echo "🔧 Enabling SusFS Configs..."
+        echo "CONFIG_KSU_SUSFS=y" >> $CONFIG_FILE
+        echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> $CONFIG_FILE
+        echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> $CONFIG_FILE
+        echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> $CONFIG_FILE
+        echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> $CONFIG_FILE
+        echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> $CONFIG_FILE
+        echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> $CONFIG_FILE
+        echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> $CONFIG_FILE
+        
+        echo "SUSFS_VERSION=kernel-4.19" >> $GITHUB_ENV
+        echo "✅ SusFS injection process completed."
+
+    - name: Build kernel
+      run: |
+        cd kernel_workspace/android-kernel
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export BRAND_SHOW_FLAG=oneplus
+        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH
+        export KBUILD_BUILD_HOST=Github-Action
+        export KBUILD_BUILD_USER=$(echo ${{ github.actor }} | tr A-Z a-z)
+
+        BA_CMD="CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-"
+        EX_CMD="LD=ld.lld LLVM=1 LLVM_IAS=1"
+        DEFCONFIG="vendor/kona-perf_defconfig vendor/debugfs.config vendor/oplus.config"
+
+        make O=out CC=clang $BA_CMD $EX_CMD $DEFCONFIG
+        make -j$(nproc --all) O=out CC=clang $BA_CMD $EX_CMD
+
+    - name: Check kernel output
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel/out
+
+        if [ -f arch/arm64/boot/Image ]; then
+          echo "CHECK_IMAGE=true" >> $GITHUB_ENV
+          echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> $GITHUB_ENV
+        else
+          echo "Kernel output file is empty"
+          exit 1
+        fi
+
+    - name: Prepare AnyKernel3 and package
+      run: |
+        cd kernel_workspace
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3
+        sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+        sed -i 's!BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!BLOCK=auto;!g' AnyKernel3/anykernel.sh
+        sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' AnyKernel3/anykernel.sh
+        rm -rf AnyKernel3/.git* AnyKernel3/README.md
+        cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
+
+        cd AnyKernel3
+        
+        SUS_TAG=""
+        if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then
+            SUS_TAG="-SusFS"
+        fi
+        
+        zip -r AK3-${{ inputs.LINEAGE_BRANCH }}-OPlus-SM8250-${{ inputs.KSU_MODE }}${SUS_TAG}_KSU_${{ env.RSKSUVER }}.zip ./*
+        
+        echo "ZIP_NAME=$(ls *.zip)" >> $GITHUB_ENV
+
+    - name: Upload AnyKernel3 ZIP (GitHub Artifact)
+      uses: actions/upload-artifact@v4
+      with:
+        name: AK3-${{ inputs.KSU_MODE }}
+        path: kernel_workspace/AnyKernel3/*.zip
+
+    - name: Send to Telegram Bot
+      if: success()
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        cd kernel_workspace/AnyKernel3
+        
+        CAPTION="✅ *Kernel Build Success!*%0A%0A"
+        CAPTION+="🔸 *Branch:* \`${{ inputs.LINEAGE_BRANCH }}\`%0A"
+        CAPTION+="🔸 *Mode:* \`${{ inputs.KSU_MODE }}\`%0A"
+        CAPTION+="🔸 *Kernel Version:* \`${{ env.KERNEL_VERSION }}\`%0A"
+        CAPTION+="🔸 *KSU Version:* \`${{ env.RSKSUVER }}\`%0A"
+        
+        if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then
+           CAPTION+="🔸 *SusFS:* \`Enabled (kernel-4.19)\`%0A"
+        else
+           CAPTION+="🔸 *SusFS:* \`Disabled\`%0A"
+        fi
+        
+        curl -s -F chat_id=$TELEGRAM_CHAT_ID \
+             -F document=@${{ env.ZIP_NAME }} \
+             -F parse_mode=Markdown \
+             -F caption="$CAPTION" \
+             https://api.telegram.org/bot$TELEGRAM_TOKEN/sendDocument
