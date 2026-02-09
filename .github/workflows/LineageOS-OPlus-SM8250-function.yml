@@ -1,12 +1,12 @@
-name: Build LineageOS Kernel (SusFS Fix)
+name: Build LineageOS Kernel (rsuntk + SusFS)
 
 on:
   workflow_dispatch:
     inputs:
       LINEAGE_BRANCH:
-        description: 'LineageOS 分支 (例如 lineage-23.0)'
+        description: 'LineageOS 分支 (例如 lineage-23.2)'
         required: true
-        default: 'lineage-23.0'
+        default: 'lineage-23.2'
       
       ENABLE_SUSFS:
         description: '启用 SusFS v1.5.5 (稳定版)'
@@ -108,8 +108,8 @@ jobs:
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    # ✅ SusFS 修复逻辑：除了复制文件，增加 Patch 操作！
-    - name: Inject SusFS (Patching)
+    # ✅ 真正修复 SusFS：使用 sed 手术刀式注入，解决 0x555e1 报错
+    - name: Inject SusFS (Manual Patch)
       if: inputs.ENABLE_SUSFS == true
       run: |
         cd kernel_workspace
@@ -120,29 +120,29 @@ jobs:
         
         cd android-kernel
         
-        # 1. 复制文件 (你之前的步骤)
+        # 1. 复制 SusFS 源文件
         echo "📋 Copying SusFS files from kernel_patches..."
         cp -af "${SUSFS_DIR}/kernel_patches/fs/"* fs/
         cp -af "${SUSFS_DIR}/kernel_patches/include/linux/"* include/linux/
         
-        # 2. 🔥 应用内核补丁 (解决 Error 2: sub-make)
+        # 2. 应用内核构建补丁 (让内核编译 SusFS)
         echo "🩹 Applying SusFS Kernel Patch..."
         if [ -f "${SUSFS_DIR}/kernel_patches/50_add_susfs_in_kernel-4.19.patch" ]; then
-            patch -p1 < "${SUSFS_DIR}/kernel_patches/50_add_susfs_in_kernel-4.19.patch" || echo "⚠️ Kernel patch failed or already applied"
+            patch -p1 < "${SUSFS_DIR}/kernel_patches/50_add_susfs_in_kernel-4.19.patch" || echo "⚠️ Kernel patch failed"
         fi
         
-        # 3. 🔥🔥 应用 KernelSU 补丁 (解决 0x555e1 报错)
-        # rsuntk 必须打这个补丁才能认识 SusFS 指令
-        echo "🩹 Applying SusFS KernelSU Patch..."
-        if [ -f "${SUSFS_DIR}/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
-            cd KernelSU
-            patch -p1 < "${SUSFS_DIR}/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || echo "⚠️ KSU patch failed, check version"
-            cd ..
-        else
-             echo "⚠️ Patch file not found, skipping..."
-        fi
+        # 3. 🔥 手动注入 KernelSU 挂钩 (替代不稳定的 patch 文件)
+        # 解决 CMD: '0x555e1', SUSFS operation not supported
+        echo "🔧 Manually patching KernelSU core_hook.c..."
         
-        # 4. 开启配置
+        # 在头文件引用区加入 susfs.h
+        sed -i '/#include "ksu.h"/a #include <linux/susfs.h>' KernelSU/kernel/core_hook.c
+        
+        # 在 ksu_handle_ioctl 函数最开始插入拦截逻辑
+        # 只要遇到 SusFS 的指令，就转交给 SusFS 处理
+        sed -i '/int ksu_handle_ioctl/a \ \ \ \ if (susfs_ksu_ioctl(cmd, arg, 0)) return 0;' KernelSU/kernel/core_hook.c
+        
+        # 4. 开启 SusFS 配置
         CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
         echo "🔧 Enabling SusFS Configs..."
         echo "CONFIG_KSU_SUSFS=y" >> $CONFIG_FILE
@@ -157,7 +157,7 @@ jobs:
         echo "SUSFS_VERSION=kernel-4.19" >> $GITHUB_ENV
         echo "✅ SusFS injection process completed."
 
-    # ✅ 注入内核优化扩展 (ZRAM 已移除，保留修复好的 LSM)
+    # ✅ 注入内核优化扩展 (ZRAM 已移除)
     - name: Inject Kernel Extensions
       run: |
         cd kernel_workspace/android-kernel
@@ -260,7 +260,7 @@ jobs:
         CAPTION+="🔸 *Kernel Version:* \`${{ env.KERNEL_VERSION }}\`%0A"
         CAPTION+="🔸 *KSU Version:* \`${{ env.RSKSUVER }}\`%0A%0A"
         
-        # 显示优化功能状态 (ZRAM 已移除)
+        # 显示优化功能状态
         if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then CAPTION+="🔹 *SusFS:* ✅%0A"; else CAPTION+="🔹 *SusFS:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_LSM }}" == "true" ]; then CAPTION+="🔹 *LSM/BBG:* ✅%0A"; else CAPTION+="🔹 *LSM/BBG:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_NETFILTER }}" == "true" ]; then CAPTION+="🔹 *Netfilter:* ✅%0A"; else CAPTION+="🔹 *Netfilter:* ❌%0A"; fi
