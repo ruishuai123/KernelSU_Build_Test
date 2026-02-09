@@ -9,12 +9,11 @@ on:
         default: 'lineage-23.2'
        
       ENABLE_SUSFS:
-        description: '启用 SusFS v1.5.5 (稳定版)'
+        description: '启用 SusFS (使用 rsuntk susfs 分支)'
         required: true
         type: boolean
         default: true
 
-      # ✅ 优化功能开关 (已移除 ZRAM)
       ENABLE_NETFILTER:
         description: '启用 NETFILTER (TTL/HL/TPROXY)'
         required: true
@@ -56,7 +55,7 @@ jobs:
         echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> $GITHUB_ENV
         echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> $GITHUB_ENV
         sudo apt-get update
-        sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev patch
+        sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
 
     - name: Cache Clang toolchain
@@ -96,118 +95,59 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace
         git clone --recursive https://github.com/LineageOS/android_kernel_oneplus_sm8250 -b ${{ inputs.LINEAGE_BRANCH }} android-kernel --depth=1
 
-    - name: Set up KernelSU (rsuntk)
+    - name: Set up KernelSU (rsuntk) + SusFS branch
       run: |
         cd kernel_workspace/android-kernel
 
-        curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s main
+        # ✅ 用 rsuntk 提供的 SusFS 分支（省去 susfs4ksu patch 冲突）
+        if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then
+          curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s susfs-rksu-master
+        else
+          curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s main
+        fi
+
         bash $GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh || true
 
-        # ✅ 独立 fragment，避免被后续 config 覆盖
-        KSU_CFG="arch/arm64/configs/vendor/kernelsu.config"
+        # ✅ 独立 fragment，避免被 vendor/oplus.config 覆盖
         mkdir -p arch/arm64/configs/vendor
+
+        KSU_CFG="arch/arm64/configs/vendor/kernelsu.config"
         {
           echo "CONFIG_KSU=y"
           echo "CONFIG_KSU_MANUAL_HOOK=y"
         } > "$KSU_CFG"
 
+        SUS_CFG="arch/arm64/configs/vendor/susfs.config"
+        if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then
+          {
+            echo "CONFIG_KSU_SUSFS=y"
+            # 常见依赖（更稳）
+            echo "CONFIG_OVERLAY_FS=y"
+            echo "CONFIG_TMPFS_XATTR=y"
+            # 若你 manager 用 magic mount，建议开启
+            echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
+          } > "$SUS_CFG"
+        else
+          : > "$SUS_CFG"
+        fi
+
         RSKSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
         echo "RSKSUVER=$RSKSUVER" >> $GITHUB_ENV
-        
+
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    # SusFS 注入逻辑（修正版：对内核/KernelSU分别正确打补丁，并使用 3way+fuzz 容错）
-    - name: Inject SusFS (kernel-4.19)
-      if: inputs.ENABLE_SUSFS == true
-      run: |
-        set -e
-        cd kernel_workspace
-        echo "⬇️ Cloning SusFS (kernel-4.19 branch)..."
-        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
-
-        SUSFS_DIR="$(pwd)/susfs4ksu"
-        KERNEL_DIR="$(pwd)/android-kernel"
-
-        echo "===== SusFS DIR: $SUSFS_DIR ====="
-        echo "===== Kernel DIR: $KERNEL_DIR ====="
-
-        KPATCH="$SUSFS_DIR/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
-        KSU_PATCH="$SUSFS_DIR/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-
-        if [ ! -f "$KPATCH" ]; then
-          echo "❌ Kernel patch not found: $KPATCH"
-          exit 1
-        fi
-        if [ ! -f "$KSU_PATCH" ]; then
-          echo "❌ KernelSU patch not found: $KSU_PATCH"
-          exit 1
-        fi
-
-        # 1) 对 LineageOS kernel tree 应用 SusFS kernel patch
-        echo "🧩 Applying SusFS kernel patch to android-kernel..."
-        cd "$KERNEL_DIR"
-
-        if git apply --3way --whitespace=nowarn "$KPATCH"; then
-          echo "✅ Kernel patch applied via git apply --3way"
-        else
-          echo "⚠️ git apply --3way failed, trying GNU patch with fuzz..."
-          # --forward: 已应用则跳过；--fuzz=3: 允许上下文偏移；失败就终止（否则做出来还是没 SusFS）
-          patch -p1 --forward --fuzz=3 < "$KPATCH"
-          echo "✅ Kernel patch applied via patch --fuzz=3"
-        fi
-
-        # 2) 对 KernelSU repo 应用 enable patch（注意路径：android-kernel/KernelSU）
-        echo "🧩 Applying SusFS KernelSU patch to android-kernel/KernelSU..."
-        cd "$KERNEL_DIR/KernelSU"
-
-        if git apply --3way --whitespace=nowarn "$KSU_PATCH"; then
-          echo "✅ KernelSU patch applied via git apply --3way"
-        else
-          echo "⚠️ git apply --3way failed, trying GNU patch with fuzz..."
-          patch -p1 --forward --fuzz=3 < "$KSU_PATCH"
-          echo "✅ KernelSU patch applied via patch --fuzz=3"
-        fi
-
-        # 3) SusFS 配置用独立 fragment，避免被 vendor/oplus.config 覆盖
-        cd "$KERNEL_DIR"
-        SUS_CFG="arch/arm64/configs/vendor/susfs.config"
-        mkdir -p arch/arm64/configs/vendor
-        {
-          echo "CONFIG_KSU_SUSFS=y"
-          echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
-          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y"
-          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
-          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-          # 常见依赖（更稳）
-          echo "CONFIG_OVERLAY_FS=y"
-          echo "CONFIG_TMPFS_XATTR=y"
-          # 若你管理器使用 magic mount，建议启用
-          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
-        } > "$SUS_CFG"
-
-        echo "SUSFS_VERSION=kernel-4.19" >> $GITHUB_ENV
-        echo "✅ SusFS injection process completed."
-
-    # ✅ 注入内核优化扩展 (已移除 ZRAM)
     - name: Inject Kernel Extensions
       run: |
         cd kernel_workspace/android-kernel
         CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
         
-        # 1. LSM / Baseband Guard
         if [ "${{ inputs.ENABLE_LSM }}" == "true" ]; then
             echo "🛡️ Setting up Baseband Guard (LSM)..."
             curl -LSs https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh | bash
             echo "CONFIG_BBG=y" >> $CONFIG_FILE
-            
-            # 关键修复：将 baseband_guard 加入 security/Kconfig 的默认 LSM 列表
             sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
         fi
         
-        # 2. NETFILTER (TTL/HL/TPROXY)
         if [ "${{ inputs.ENABLE_NETFILTER }}" == "true" ]; then
             echo "🌐 Enabling Netfilter enhancements..."
             echo "CONFIG_NETFILTER_XT_TARGET_TTL=y" >> $CONFIG_FILE
@@ -216,7 +156,6 @@ jobs:
             echo "CONFIG_NETFILTER_XT_MATCH_TPROXY=y" >> $CONFIG_FILE
         fi
         
-        # 3. BBR + ECN
         if [ "${{ inputs.ENABLE_BBR }}" == "true" ]; then
             echo "🚀 Enabling TCP BBR + ECN..."
             echo "CONFIG_TCP_CONG_BBR=y" >> $CONFIG_FILE
@@ -238,7 +177,7 @@ jobs:
         BA_CMD="CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-"
         EX_CMD="LD=ld.lld LLVM=1 LLVM_IAS=1"
 
-        # ✅ kernelsu.config / susfs.config 放最后，防止被 vendor/oplus.config 覆盖
+        # ✅ 把 kernelsu.config / susfs.config 放最后，防止被 vendor/oplus.config 覆盖
         DEFCONFIG_LIST="vendor/kona-perf_defconfig vendor/debugfs.config vendor/oplus.config vendor/kernelsu.config"
         if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then
           DEFCONFIG_LIST="$DEFCONFIG_LIST vendor/susfs.config"
@@ -252,7 +191,7 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         echo "===== FINAL CONFIG CHECK ====="
         if [ -f out/.config ]; then
-          grep -E "CONFIG_KSU=|CONFIG_KSU_SUSFS=|CONFIG_OVERLAY_FS=|CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=" out/.config || true
+          grep -E "CONFIG_KSU=|CONFIG_KSU_SUSFS=|CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=|CONFIG_OVERLAY_FS=|CONFIG_TMPFS_XATTR=" out/.config || true
           echo "===== END CHECK ====="
         else
           echo "out/.config not found!"
@@ -298,7 +237,6 @@ jobs:
         name: AK3-rsuntk
         path: kernel_workspace/AnyKernel3/*.zip
 
-    # ✅ 成功通知（发送文件）
     - name: Send Success to Telegram
       if: success()
       env:
@@ -323,7 +261,6 @@ jobs:
               -F caption="$CAPTION" \
               https://api.telegram.org/bot$TELEGRAM_TOKEN/sendDocument
 
-    # ❌ 失败通知（新增部分）
     - name: Send Failure to Telegram
       if: failure()
       env:
