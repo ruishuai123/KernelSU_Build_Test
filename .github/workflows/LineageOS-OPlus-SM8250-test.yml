@@ -1,4 +1,4 @@
-name: Build LineageOS Kernel (rsuntk + SusFS Fixed)
+name: Build LineageOS Kernel (rsuntk + SusFS)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
         description: 'LineageOS 分支 (例如 lineage-23.2)'
         required: true
         default: 'lineage-23.2'
-      
+       
       ENABLE_SUSFS:
         description: '启用 SusFS v1.5.5 (稳定版)'
         required: true
@@ -20,7 +20,7 @@ on:
         required: true
         type: boolean
         default: true
-      
+       
       ENABLE_BBR:
         description: '启用 BBR + ECN (TCP优化)'
         required: true
@@ -96,55 +96,78 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace
         git clone --recursive https://github.com/LineageOS/android_kernel_oneplus_sm8250 -b ${{ inputs.LINEAGE_BRANCH }} android-kernel --depth=1
 
-    # ✅ 按照要求只改这里：rsuntk 安装 + 补全文件 + 删检查
     - name: Set up KernelSU (rsuntk)
       run: |
         cd kernel_workspace/android-kernel
 
-        # 1. 安装 KernelSU (susfs-rksu-master)
-        curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh" | bash -s susfs-rksu-master
-        
-        # 2. 补全 SusFS 文件 (setup.sh 不负责这块，手动补上)
-        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
-        cp -af "susfs4ksu/kernel_patches/fs/"* fs/
-        cp -af "susfs4ksu/kernel_patches/include/linux/"* include/linux/
-        
-        # 3. 暴力删除 Makefile 报错 (强制通行)
-        if [ -f "drivers/kernelsu/Makefile" ]; then
-             sed -i '/error -- You have not integrated susfs/d' drivers/kernelsu/Makefile
-        fi
-
-        # 4. 通用补丁 & 配置
+        curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s main
         bash $GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh || true
-        echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/vendor/kona-perf_defconfig
+
+        # ✅ 不再直接写进 kona-perf_defconfig，改为独立 fragment，避免被后续 config 覆盖
+        KSU_CFG="arch/arm64/configs/vendor/kernelsu.config"
+        mkdir -p arch/arm64/configs/vendor
+        {
+          echo "CONFIG_KSU=y"
+          echo "CONFIG_KSU_MANUAL_HOOK=y"
+        } > "$KSU_CFG"
+
         RSKSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
         echo "RSKSUVER=$RSKSUVER" >> $GITHUB_ENV
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    # ✅ SusFS 补丁 (JackA1ltman版)
-    - name: Enable SusFS Configs
+    # SusFS 注入逻辑（修正版：优先打 patch，其次才 copy）
+    - name: Inject SusFS (kernel-4.19)
       if: inputs.ENABLE_SUSFS == true
       run: |
-        cd kernel_workspace/android-kernel
-        
-        # 应用 patch 以适配 4.19 内核源码
-        wget -O susfs_jack.patch https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/refs/heads/mainline/Patches/Patch/susfs_patch_to_4.19.patch
-        patch -p1 --ignore-whitespace < susfs_jack.patch || true
+        cd kernel_workspace
+        echo "⬇️ Cloning SusFS (kernel-4.19 branch)..."
+        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
 
-        CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
-        echo "🔧 Enabling SusFS Configs..."
-        echo "CONFIG_KSU_SUSFS=y" >> $CONFIG_FILE
-        echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> $CONFIG_FILE
-        echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> $CONFIG_FILE
-        echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> $CONFIG_FILE
-        echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> $CONFIG_FILE
-        echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> $CONFIG_FILE
-        echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> $CONFIG_FILE
-        echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> $CONFIG_FILE
-        
+        SUSFS_DIR="$(pwd)/susfs4ksu"
+        cd android-kernel
+
+        echo "🧩 Trying to apply SusFS patches (preferred)..."
+        set +e
+        PATCH_COUNT=$(find "$SUSFS_DIR" -type f \( -name "*.patch" -o -name "*.diff" \) | wc -l)
+        set -e
+
+        if [ "$PATCH_COUNT" -gt 0 ]; then
+          echo "✅ Found patch files: $PATCH_COUNT"
+          # 尝试按顺序应用所有 patch（如果某些已应用/不适配会失败，直接停掉让你看到日志）
+          find "$SUSFS_DIR" -type f \( -name "*.patch" -o -name "*.diff" \) -print0 | sort -z | xargs -0 -I{} bash -c 'echo "Applying {}"; git apply --whitespace=nowarn "{}"'
+          echo "✅ SusFS patches applied."
+        else
+          echo "⚠️ No patch files found, fallback to copying kernel_patches (may be incomplete depending on upstream)."
+          if [ -d "${SUSFS_DIR}/kernel_patches/fs" ]; then
+            cp -af "${SUSFS_DIR}/kernel_patches/fs/"* fs/
+          fi
+          if [ -d "${SUSFS_DIR}/kernel_patches/include/linux" ]; then
+            cp -af "${SUSFS_DIR}/kernel_patches/include/linux/"* include/linux/
+          fi
+        fi
+
+        # ✅ SusFS 配置改为独立 fragment，且会在最终 DEFCONFIG 列表最后加入，避免被覆盖
+        SUS_CFG="arch/arm64/configs/vendor/susfs.config"
+        mkdir -p arch/arm64/configs/vendor
+        {
+          echo "CONFIG_KSU_SUSFS=y"
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y"
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+          # 常见依赖（不一定缺，但开了更稳）
+          echo "CONFIG_OVERLAY_FS=y"
+          echo "CONFIG_TMPFS_XATTR=y"
+          # 如果你用的是 magic mount（不少 KSU 管理器默认/推荐），建议打开
+          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
+        } > "$SUS_CFG"
+
         echo "SUSFS_VERSION=kernel-4.19" >> $GITHUB_ENV
-        echo "✅ SusFS configs enabled."
+        echo "✅ SusFS injection process completed."
 
     # ✅ 注入内核优化扩展 (已移除 ZRAM)
     - name: Inject Kernel Extensions
@@ -192,10 +215,27 @@ jobs:
 
         BA_CMD="CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-"
         EX_CMD="LD=ld.lld LLVM=1 LLVM_IAS=1"
-        DEFCONFIG="vendor/kona-perf_defconfig vendor/debugfs.config vendor/oplus.config"
 
-        make O=out CC=clang $BA_CMD $EX_CMD $DEFCONFIG
+        # ✅ 关键修复：把 kernelsu.config / susfs.config 放到最后，防止被 vendor/oplus.config 覆盖
+        DEFCONFIG_LIST="vendor/kona-perf_defconfig vendor/debugfs.config vendor/oplus.config vendor/kernelsu.config"
+        if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then
+          DEFCONFIG_LIST="$DEFCONFIG_LIST vendor/susfs.config"
+        fi
+
+        make O=out CC=clang $BA_CMD $EX_CMD $DEFCONFIG_LIST
         make -j$(nproc --all) O=out CC=clang $BA_CMD $EX_CMD
+
+    - name: Verify KSU/SusFS configs in final .config
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        echo "===== FINAL CONFIG CHECK ====="
+        if [ -f out/.config ]; then
+          grep -E "CONFIG_KSU=|CONFIG_KSU_SUSFS=|CONFIG_OVERLAY_FS=|CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=" out/.config || true
+          echo "===== END CHECK ====="
+        else
+          echo "out/.config not found!"
+          exit 1
+        fi
 
     - name: Check kernel output
       run: |
@@ -236,7 +276,8 @@ jobs:
         name: AK3-rsuntk
         path: kernel_workspace/AnyKernel3/*.zip
 
-    - name: Send to Telegram Bot
+    # ✅ 成功通知（发送文件）
+    - name: Send Success to Telegram
       if: success()
       env:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -249,14 +290,30 @@ jobs:
         CAPTION+="🔸 *Kernel Version:* \`${{ env.KERNEL_VERSION }}\`%0A"
         CAPTION+="🔸 *KSU Version:* \`${{ env.RSKSUVER }}\`%0A%0A"
         
-        # 显示优化功能状态 (ZRAM 已移除)
         if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then CAPTION+="🔹 *SusFS:* ✅%0A"; else CAPTION+="🔹 *SusFS:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_LSM }}" == "true" ]; then CAPTION+="🔹 *LSM/BBG:* ✅%0A"; else CAPTION+="🔹 *LSM/BBG:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_NETFILTER }}" == "true" ]; then CAPTION+="🔹 *Netfilter:* ✅%0A"; else CAPTION+="🔹 *Netfilter:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_BBR }}" == "true" ]; then CAPTION+="🔹 *BBR+ECN:* ✅%0A"; else CAPTION+="🔹 *BBR+ECN:* ❌%0A"; fi
         
         curl -s -F chat_id=$TELEGRAM_CHAT_ID \
-             -F document=@${{ env.ZIP_NAME }} \
-             -F parse_mode=Markdown \
-             -F caption="$CAPTION" \
-             https://api.telegram.org/bot$TELEGRAM_TOKEN/sendDocument
+              -F document=@${{ env.ZIP_NAME }} \
+              -F parse_mode=Markdown \
+              -F caption="$CAPTION" \
+              https://api.telegram.org/bot$TELEGRAM_TOKEN/sendDocument
+
+    # ❌ 失败通知（新增部分）
+    - name: Send Failure to Telegram
+      if: failure()
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        MESSAGE="❌ *Kernel Build Failed!*%0A%0A"
+        MESSAGE+="🔸 *Branch:* \`${{ inputs.LINEAGE_BRANCH }}\`%0A"
+        MESSAGE+="🔸 *Build User:* \`${{ github.actor }}\`%0A%0A"
+        MESSAGE+="📋 *Logs:* [View Action Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+        curl -s -X POST https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage \
+            -d chat_id=$TELEGRAM_CHAT_ID \
+            -d parse_mode=Markdown \
+            -d text="$MESSAGE"
