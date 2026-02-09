@@ -349,7 +349,7 @@ jobs:
 
     # ✅ 成功通知（发送文件）
     - name: Send Success to Telegram
-      if: success()
+      if: success() && secrets.TELEGRAM_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != ''
       env:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -374,7 +374,7 @@ jobs:
 
     # ❌ 失败通知（新增部分）
     - name: Send Failure to Telegram
-      if: failure()
+      if: failure() && secrets.TELEGRAM_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != ''
       env:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
