@@ -7,7 +7,7 @@ on:
         description: 'LineageOS 分支 (例如 lineage-23.2)'
         required: true
         default: 'lineage-23.2'
-      
+       
       ENABLE_SUSFS:
         description: '启用 SusFS v1.5.5 (稳定版)'
         required: true
@@ -20,7 +20,7 @@ on:
         required: true
         type: boolean
         default: true
-      
+       
       ENABLE_BBR:
         description: '启用 BBR + ECN (TCP优化)'
         required: true
@@ -228,7 +228,8 @@ jobs:
         name: AK3-rsuntk
         path: kernel_workspace/AnyKernel3/*.zip
 
-    - name: Send to Telegram Bot
+    # ✅ 成功通知（发送文件）
+    - name: Send Success to Telegram
       if: success()
       env:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -241,14 +242,30 @@ jobs:
         CAPTION+="🔸 *Kernel Version:* \`${{ env.KERNEL_VERSION }}\`%0A"
         CAPTION+="🔸 *KSU Version:* \`${{ env.RSKSUVER }}\`%0A%0A"
         
-        # 显示优化功能状态 (ZRAM 已移除)
         if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then CAPTION+="🔹 *SusFS:* ✅%0A"; else CAPTION+="🔹 *SusFS:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_LSM }}" == "true" ]; then CAPTION+="🔹 *LSM/BBG:* ✅%0A"; else CAPTION+="🔹 *LSM/BBG:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_NETFILTER }}" == "true" ]; then CAPTION+="🔹 *Netfilter:* ✅%0A"; else CAPTION+="🔹 *Netfilter:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_BBR }}" == "true" ]; then CAPTION+="🔹 *BBR+ECN:* ✅%0A"; else CAPTION+="🔹 *BBR+ECN:* ❌%0A"; fi
         
         curl -s -F chat_id=$TELEGRAM_CHAT_ID \
-             -F document=@${{ env.ZIP_NAME }} \
-             -F parse_mode=Markdown \
-             -F caption="$CAPTION" \
-             https://api.telegram.org/bot$TELEGRAM_TOKEN/sendDocument
+              -F document=@${{ env.ZIP_NAME }} \
+              -F parse_mode=Markdown \
+              -F caption="$CAPTION" \
+              https://api.telegram.org/bot$TELEGRAM_TOKEN/sendDocument
+
+    # ❌ 失败通知（新增部分）
+    - name: Send Failure to Telegram
+      if: failure()
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        MESSAGE="❌ *Kernel Build Failed!*%0A%0A"
+        MESSAGE+="🔸 *Branch:* \`${{ inputs.LINEAGE_BRANCH }}\`%0A"
+        MESSAGE+="🔸 *Build User:* \`${{ github.actor }}\`%0A%0A"
+        MESSAGE+="📋 *Logs:* [View Action Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+        curl -s -X POST https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage \
+            -d chat_id=$TELEGRAM_CHAT_ID \
+            -d parse_mode=Markdown \
+            -d text="$MESSAGE"
