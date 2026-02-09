@@ -56,7 +56,7 @@ jobs:
         echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> $GITHUB_ENV
         echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> $GITHUB_ENV
         sudo apt-get update
-        sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev
+        sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev patch
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
 
     - name: Cache Clang toolchain
@@ -100,7 +100,7 @@ jobs:
       run: |
         cd kernel_workspace/android-kernel
 
-        # ✅ SusFS 开启时使用兼容分支，避免主分支缺少 SusFS 相关改动导致构建失败
+        # ✅ SusFS 开启时用 susfs-rksu-master，否则用 main
         if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
           curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s susfs-rksu-master
         else
@@ -114,21 +114,134 @@ jobs:
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    # SusFS 注入逻辑
+    # ✅ SusFS：应用 kernel patch + 修复 fs/namespace.c 两个 reject
     - name: Inject SusFS (kernel-4.19)
       if: inputs.ENABLE_SUSFS == true
       run: |
+        set -e
         cd kernel_workspace
         echo "⬇️ Cloning SusFS (kernel-4.19 branch)..."
+        rm -rf susfs4ksu
         git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
         
         SUSFS_DIR="$(pwd)/susfs4ksu"
         
         cd android-kernel
-        
-        echo "📋 Copying SusFS files from kernel_patches..."
-        cp -af "${SUSFS_DIR}/kernel_patches/fs/"* fs/
-        cp -af "${SUSFS_DIR}/kernel_patches/include/linux/"* include/linux/
+
+        echo "🧩 Applying SusFS kernel patch with fuzz..."
+        set +e
+        patch -p1 --forward --fuzz=3 < "${SUSFS_DIR}/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
+        PATCH_RC=$?
+        set -e
+        echo "patch exit code: ${PATCH_RC} (1 means rejects may exist)"
+
+        if [ -f fs/namespace.c.rej ]; then
+          echo "⚠️ Found fs/namespace.c.rej, applying manual fix..."
+
+          cat > /tmp/susfs_fix_namespace.py <<'PY'
+          import re, pathlib, sys
+          
+          p = pathlib.Path("fs/namespace.c")
+          txt = p.read_text(encoding="utf-8", errors="ignore")
+          
+          # 1) vfs_kern_mount: replace alloc_vfsmnt(name);
+          vfs_pat = re.compile(
+              r"(vfs_kern_mount\s*\(.*?\)\s*\{.*?)(\n\s*mnt\s*=\s*alloc_vfsmnt\s*\(\s*name\s*\)\s*;\s*\n)",
+              re.S
+          )
+          
+          vfs_repl_block = r"""
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          	// For newly created mounts, the only caller process we care is KSU
+          	if (unlikely(susfs_is_current_ksu_domain())) {
+          		mnt = alloc_vfsmnt(name, true, 0);
+          		goto bypass_orig_flow;
+          	}
+          	mnt = alloc_vfsmnt(name, false, 0);
+          bypass_orig_flow:
+          #else
+          	mnt = alloc_vfsmnt(name);
+          #endif
+          """
+          
+          m = vfs_pat.search(txt)
+          if not m:
+              needle = "mnt = alloc_vfsmnt(name);"
+              if needle in txt:
+                  txt = txt.replace(needle, vfs_repl_block.strip("\n"), 1)
+              else:
+                  print("❌ Cannot find alloc_vfsmnt(name) in vfs_kern_mount.")
+                  sys.exit(1)
+          else:
+              txt = vfs_pat.sub(lambda mm: mm.group(1) + "\n" + vfs_repl_block + "\n", txt, count=1)
+          
+          # 2) clone_mnt: replace alloc_vfsmnt(old->mnt_devname);
+          clone_sig = re.search(r"static\s+struct\s+mount\s*\*\s*clone_mnt\s*\(([^)]*)\)\s*\{", txt, re.S)
+          if not clone_sig:
+              print("❌ Cannot find clone_mnt signature.")
+              sys.exit(1)
+          
+          params = clone_sig.group(1).strip()
+          last_param = params.split(",")[-1].strip()
+          var_name = re.split(r"\s+", last_param)[-1].replace("*", "").strip() or "flag"
+          
+          clone_repl_block = f"""
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          	bool is_current_ksu_domain = susfs_is_current_ksu_domain();
+          	bool is_current_zygote_domain = susfs_is_current_zygote_domain();
+          
+          	// KSU process handling
+          	if (unlikely(is_current_ksu_domain)) {{
+          		if (!({var_name} & CL_COPY_MNT_NS)) {{
+          			mnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          			goto bypass_orig_flow;
+          		}}
+          		mnt = alloc_vfsmnt(old->mnt_devname, true, old->mnt_id);
+          		if (mnt) {{
+          			mnt->mnt.susfs_mnt_id_backup = DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE;
+          		}}
+          		goto bypass_orig_flow;
+          	}}
+          
+          	// zygote handling for sus mounts
+          	if (likely(is_current_zygote_domain) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {{
+          		mnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          		goto bypass_orig_flow;
+          	}}
+          
+          	// other unshare handling
+          	if (({var_name} & CL_COPY_MNT_NS) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {{
+          		mnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          		goto bypass_orig_flow;
+          	}}
+          
+          	mnt = alloc_vfsmnt(old->mnt_devname, false, 0);
+          bypass_orig_flow:
+          #else
+          	mnt = alloc_vfsmnt(old->mnt_devname);
+          #endif
+          """
+          
+          idx = txt.find("static struct mount *clone_mnt")
+          seg = txt[idx:] if idx >= 0 else txt
+          needle2 = "mnt = alloc_vfsmnt(old->mnt_devname);"
+          pos = seg.find(needle2)
+          if pos < 0:
+              print("❌ Cannot find alloc_vfsmnt(old->mnt_devname) in clone_mnt.")
+              sys.exit(1)
+          
+          seg2 = seg.replace(needle2, clone_repl_block.strip("\n"), 1)
+          txt = txt[:idx] + seg2 if idx >= 0 else seg2
+          
+          p.write_text(txt, encoding="utf-8")
+          print("✅ Manual SusFS fixes applied to fs/namespace.c")
+          PY
+          sed -i 's/^          //' /tmp/susfs_fix_namespace.py
+          python3 /tmp/susfs_fix_namespace.py
+
+          rm -f fs/namespace.c.rej
+          echo "✅ Removed fs/namespace.c.rej after manual fix."
+        fi
         
         CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
         echo "🔧 Enabling SusFS Configs..."
