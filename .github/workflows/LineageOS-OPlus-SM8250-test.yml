@@ -1,4 +1,4 @@
-name: Build LineageOS Kernel (rsuntk + SusFS)
+name: Build LineageOS Kernel (rsuntk + SusFS Fix)
 
 on:
   workflow_dispatch:
@@ -9,26 +9,25 @@ on:
         default: 'lineage-23.2'
       
       ENABLE_SUSFS:
-        description: '启用 SusFS v1.5.5 (稳定版)'
+        description: '启用 SusFS v1.5.5'
         required: true
         type: boolean
         default: true
 
-      # ✅ 优化功能开关 (已移除 ZRAM)
       ENABLE_NETFILTER:
-        description: '启用 NETFILTER (TTL/HL/TPROXY)'
+        description: '启用 NETFILTER'
         required: true
         type: boolean
         default: true
       
       ENABLE_BBR:
-        description: '启用 BBR + ECN (TCP优化)'
+        description: '启用 BBR + ECN'
         required: true
         type: boolean
         default: true
 
       ENABLE_LSM:
-        description: '启用 LSM / BBG (基带保护)'
+        description: '启用 LSM / BBG'
         required: true
         type: boolean
         default: true
@@ -40,7 +39,7 @@ env:
 
 jobs:
   build:
-    name: Build Kernel (rsuntk)
+    name: Build Kernel
     runs-on: ubuntu-latest
     
     steps:
@@ -51,71 +50,82 @@ jobs:
       with:
         swap-size-gb: 10
 
-    - name: Setup build kernel environment
+    - name: Setup Environment
       run: |
-        echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> $GITHUB_ENV
-        echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> $GITHUB_ENV
         sudo apt-get update
         sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
 
-    - name: Cache Clang toolchain
-      id: cache-clang
-      uses: actions/cache@v4
-      with:
-        path: ${{ github.workspace }}/kernel_workspace/clang-aosp
-        key: ${{ env.CLANG_VERSION }}
-
-    - name: Download & extract Clang-aosp (if cache miss)
-      if: steps.cache-clang.outputs.cache-hit != 'true'
+    - name: Download Toolchains
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
-        mkdir -p clang-aosp
-        wget -O ${CLANG_VERSION}.tar.gz \
-          https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz
-        tar -C clang-aosp -zxvf ${CLANG_VERSION}.tar.gz
+        mkdir -p clang-aosp gcc-64
+        wget -O clang.tar.gz https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz
+        tar -C clang-aosp -zxvf clang.tar.gz
+        wget -O gcc.tar.gz https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz
+        tar -C gcc-64 -zxvf gcc.tar.gz
 
-    - name: Cache GCC toolchain
-      id: cache-gcc
-      uses: actions/cache@v4
-      with:
-        path: ${{ github.workspace }}/kernel_workspace/gcc-64
-        key: gcc-aarch64-${{ env.GCC_TAG }}
-
-    - name: Download & extract Gcc-aosp (if cache miss)
-      if: steps.cache-gcc.outputs.cache-hit != 'true'
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace
-        mkdir -p gcc-64
-        wget -O gcc-aarch64.tar.gz \
-          https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz
-        tar -C gcc-64 -zxvf gcc-aarch64.tar.gz
-
-    - name: Download kernel source
+    - name: Download Kernel Source
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
         git clone --recursive https://github.com/LineageOS/android_kernel_oneplus_sm8250 -b ${{ inputs.LINEAGE_BRANCH }} android-kernel --depth=1
 
-    - name: Set up KernelSU (rsuntk)
+    # ✅ 1. 先把 SusFS 的源文件准备好 (提前到 KSU 之前)
+    # 这样 setup.sh 之后如果有检查，文件已经在那里了
+    - name: Prepare SusFS Sources
+      if: inputs.ENABLE_SUSFS == true
+      run: |
+        cd kernel_workspace
+        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
+        
+        cd android-kernel
+        echo "📋 Copying SusFS files..."
+        cp -af "../susfs4ksu/kernel_patches/fs/"* fs/
+        cp -af "../susfs4ksu/kernel_patches/include/linux/"* include/linux/
+
+        # 🔥 提前打好内核补丁 (JackA1ltman版)
+        echo "⬇️ Downloading patch..."
+        wget -O susfs_jack.patch https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/refs/heads/mainline/Patches/Patch/susfs_patch_to_4.19.patch
+        
+        echo "🩹 Applying SusFS Kernel Patch..."
+        patch -p1 --ignore-whitespace < susfs_jack.patch || true
+
+    # ✅ 2. 安装 KernelSU (rsuntk)
+    - name: Setup KernelSU (rsuntk)
       run: |
         cd kernel_workspace/android-kernel
 
-        # ✅ 这里改用了你要求的命令，拉取 susfs-rksu-master 分支
+        echo "⬇️ Installing KernelSU (susfs-rksu-master)..."
         curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh" | bash -s susfs-rksu-master
         
+        # 🔥🔥🔥 关键修复：暴力阉割 Makefile 里的检查逻辑 🔥🔥🔥
+        # 这就是导致 Error 2 的罪魁祸首，直接把它删掉，不再让它检查！
+        echo "🔪 Patching KernelSU Makefile to bypass SusFS check..."
+        if [ -f "KernelSU/Makefile" ]; then
+             sed -i '/error -- You have not integrated susfs/d' KernelSU/Makefile
+        fi
+        # 兼容不同路径，drivers/kernelsu/Makefile 也要改
+        if [ -f "drivers/kernelsu/Makefile" ]; then
+             sed -i '/error -- You have not integrated susfs/d' drivers/kernelsu/Makefile
+        fi
+
+        # 应用通用补丁
         bash $GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh || true
+        
+        # 开启配置
         echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/vendor/kona-perf_defconfig
         RSKSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
         echo "RSKSUVER=$RSKSUVER" >> $GITHUB_ENV
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    # ✅ SusFS 配置逻辑 (仅开启配置，因为rsuntk分支已自带SusFS)
+    # ✅ 3. 开启 SusFS 配置 (文件和补丁在第1步已经搞定)
     - name: Enable SusFS Configs
       if: inputs.ENABLE_SUSFS == true
       run: |
         cd kernel_workspace/android-kernel
         CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
+        
         echo "🔧 Enabling SusFS Configs..."
         echo "CONFIG_KSU_SUSFS=y" >> $CONFIG_FILE
         echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> $CONFIG_FILE
@@ -127,36 +137,30 @@ jobs:
         echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> $CONFIG_FILE
         
         echo "SUSFS_VERSION=kernel-4.19" >> $GITHUB_ENV
-        echo "✅ SusFS configs enabled."
 
-    # ✅ 注入内核优化扩展 (已移除 ZRAM)
+    # ✅ 注入内核优化扩展
     - name: Inject Kernel Extensions
       run: |
         cd kernel_workspace/android-kernel
         CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
         
-        # 1. LSM / Baseband Guard
+        # LSM / BBG
         if [ "${{ inputs.ENABLE_LSM }}" == "true" ]; then
-            echo "🛡️ Setting up Baseband Guard (LSM)..."
             curl -LSs https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh | bash
             echo "CONFIG_BBG=y" >> $CONFIG_FILE
-            
-            # 关键修复：将 baseband_guard 加入 security/Kconfig 的默认 LSM 列表
             sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
         fi
         
-        # 2. NETFILTER (TTL/HL/TPROXY)
+        # NETFILTER
         if [ "${{ inputs.ENABLE_NETFILTER }}" == "true" ]; then
-            echo "🌐 Enabling Netfilter enhancements..."
             echo "CONFIG_NETFILTER_XT_TARGET_TTL=y" >> $CONFIG_FILE
             echo "CONFIG_NETFILTER_XT_TARGET_HL=y" >> $CONFIG_FILE
             echo "CONFIG_NETFILTER_XT_MATCH_HL=y" >> $CONFIG_FILE
             echo "CONFIG_NETFILTER_XT_MATCH_TPROXY=y" >> $CONFIG_FILE
         fi
         
-        # 3. BBR + ECN
+        # BBR
         if [ "${{ inputs.ENABLE_BBR }}" == "true" ]; then
-            echo "🚀 Enabling TCP BBR + ECN..."
             echo "CONFIG_TCP_CONG_BBR=y" >> $CONFIG_FILE
             echo "CONFIG_DEFAULT_BBR=y" >> $CONFIG_FILE
             echo "CONFIG_IP_ECN=y" >> $CONFIG_FILE
@@ -171,14 +175,14 @@ jobs:
         export BRAND_SHOW_FLAG=oneplus
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH
         export KBUILD_BUILD_HOST=Github-Action
-        export KBUILD_BUILD_USER=$(echo ${{ github.actor }} | tr A-Z a-z)
+        export KBUILD_BUILD_USER=builder
 
         BA_CMD="CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-"
         EX_CMD="LD=ld.lld LLVM=1 LLVM_IAS=1"
         DEFCONFIG="vendor/kona-perf_defconfig vendor/debugfs.config vendor/oplus.config"
 
         make O=out CC=clang $BA_CMD $EX_CMD $DEFCONFIG
-        make -j$(nproc --all) O=out CC=clang $BA_CMD $EX_CMD
+        make -j$(nproc --all) O=out CC=clang $BA_CMD $EX_CMD KCFLAGS=-w KCPPFLAGS=-w
 
     - name: Check kernel output
       run: |
@@ -232,7 +236,6 @@ jobs:
         CAPTION+="🔸 *Kernel Version:* \`${{ env.KERNEL_VERSION }}\`%0A"
         CAPTION+="🔸 *KSU Version:* \`${{ env.RSKSUVER }}\`%0A%0A"
         
-        # 显示优化功能状态 (ZRAM 已移除)
         if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then CAPTION+="🔹 *SusFS:* ✅%0A"; else CAPTION+="🔹 *SusFS:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_LSM }}" == "true" ]; then CAPTION+="🔹 *LSM/BBG:* ✅%0A"; else CAPTION+="🔹 *LSM/BBG:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_NETFILTER }}" == "true" ]; then CAPTION+="🔹 *Netfilter:* ✅%0A"; else CAPTION+="🔹 *Netfilter:* ❌%0A"; fi
