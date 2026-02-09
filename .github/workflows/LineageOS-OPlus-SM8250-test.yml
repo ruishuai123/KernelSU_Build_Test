@@ -100,8 +100,8 @@ jobs:
       run: |
         cd kernel_workspace/android-kernel
 
-        # ✅ 使用带 SusFS 检测/支持的分支（否则后面 SusFS 即便打上也可能不工作）
-        if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then
+        # ✅ SusFS 开启时用 susfs-rksu-master，否则用 main
+        if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
           curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s susfs-rksu-master
         else
           curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s main
@@ -114,7 +114,7 @@ jobs:
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    # SusFS 注入逻辑（修正版：应用 kernel patch + 自动修复 namespace 2 个 reject）
+    # ✅ SusFS：应用 kernel patch + 修复 fs/namespace.c 两个 reject
     - name: Inject SusFS (kernel-4.19)
       if: inputs.ENABLE_SUSFS == true
       run: |
@@ -135,17 +135,17 @@ jobs:
         set -e
         echo "patch exit code: ${PATCH_RC} (1 means rejects may exist)"
 
-        # ✅ 如果存在 namespace.c.rej，则把那两个关键 hunk 手动注入回去（否则 KSU 会 Stop）
         if [ -f fs/namespace.c.rej ]; then
-          echo "⚠️ Found fs/namespace.c.rej, applying manual fix for 2 failed hunks..."
+          echo "⚠️ Found fs/namespace.c.rej, applying manual fix..."
 
-          python3 - <<'PY'
+          # 写入 python 脚本文件，避免 YAML/HereDoc 解析问题
+          cat > /tmp/susfs_fix_namespace.py <<'PY'
 import re, pathlib, sys
 
 p = pathlib.Path("fs/namespace.c")
 txt = p.read_text(encoding="utf-8", errors="ignore")
 
-# ---------- 1) vfs_kern_mount: replace alloc_vfsmnt(name); ----------
+# 1) vfs_kern_mount: replace alloc_vfsmnt(name);
 vfs_pat = re.compile(
     r"(vfs_kern_mount\s*\(.*?\)\s*\{.*?)(\n\s*mnt\s*=\s*alloc_vfsmnt\s*\(\s*name\s*\)\s*;\s*\n)",
     re.S
@@ -171,12 +171,12 @@ if not m:
     if needle in txt:
         txt = txt.replace(needle, vfs_repl_block.strip("\n"), 1)
     else:
-        print("❌ Cannot find alloc_vfsmnt(name) in vfs_kern_mount; file layout changed.")
+        print("❌ Cannot find alloc_vfsmnt(name) in vfs_kern_mount.")
         sys.exit(1)
 else:
     txt = vfs_pat.sub(lambda mm: mm.group(1) + "\n" + vfs_repl_block + "\n", txt, count=1)
 
-# ---------- 2) clone_mnt: replace alloc_vfsmnt(old->mnt_devname); ----------
+# 2) clone_mnt: replace alloc_vfsmnt(old->mnt_devname);
 clone_sig = re.search(r"static\s+struct\s+mount\s*\*\s*clone_mnt\s*\(([^)]*)\)\s*\{", txt, re.S)
 if not clone_sig:
     print("❌ Cannot find clone_mnt signature.")
@@ -184,47 +184,38 @@ if not clone_sig:
 
 params = clone_sig.group(1).strip()
 last_param = params.split(",")[-1].strip()
-var_name = re.split(r"\s+", last_param)[-1].replace("*", "").strip()
-if not var_name:
-    var_name = "flag"
+var_name = re.split(r"\s+", last_param)[-1].replace("*", "").strip() or "flag"
 
 clone_repl_block = f"""
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 	bool is_current_ksu_domain = susfs_is_current_ksu_domain();
 	bool is_current_zygote_domain = susfs_is_current_zygote_domain();
 
-	/* - It is very important that we need to use CL_COPY_MNT_NS to identify whether 
-	 *   the clone is a copy_tree() or single mount like called by __do_loopback()
-	 * - if caller process is KSU, consider the following situation:
-	 *     1. it is NOT doing unshare => call alloc_vfsmnt() to assign a new sus mnt_id
-	 *     2. it is doing unshare => spoof the new mnt_id with the old mnt_id
-	 * - If caller process is zygote and old mnt_id is sus => call alloc_vfsmnt() to assign a new sus mnt_id
-	 * - For the rest of caller process that doing unshare => call alloc_vfsmnt() to assign a new sus mnt_id only for old sus mount
-	 */
-	// Firstly, check if it is KSU process
+	// KSU process handling
 	if (unlikely(is_current_ksu_domain)) {{
-		// if it is doing single clone
 		if (!({var_name} & CL_COPY_MNT_NS)) {{
 			mnt = alloc_vfsmnt(old->mnt_devname, true, 0);
 			goto bypass_orig_flow;
 		}}
-		// if it is doing unshare
 		mnt = alloc_vfsmnt(old->mnt_devname, true, old->mnt_id);
 		if (mnt) {{
 			mnt->mnt.susfs_mnt_id_backup = DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE;
 		}}
 		goto bypass_orig_flow;
 	}}
-	// Secondly, check if it is zygote process and no matter it is doing unshare or not
+
+	// zygote handling for sus mounts
 	if (likely(is_current_zygote_domain) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {{
 		mnt = alloc_vfsmnt(old->mnt_devname, true, 0);
 		goto bypass_orig_flow;
 	}}
-	// Lastly, for other process that is doing unshare operation, but only deal with old sus mount
+
+	// other unshare handling
 	if (({var_name} & CL_COPY_MNT_NS) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {{
 		mnt = alloc_vfsmnt(old->mnt_devname, true, 0);
 		goto bypass_orig_flow;
 	}}
+
 	mnt = alloc_vfsmnt(old->mnt_devname, false, 0);
 bypass_orig_flow:
 #else
@@ -237,14 +228,17 @@ seg = txt[idx:] if idx >= 0 else txt
 needle2 = "mnt = alloc_vfsmnt(old->mnt_devname);"
 pos = seg.find(needle2)
 if pos < 0:
-    print("❌ Cannot find 'mnt = alloc_vfsmnt(old->mnt_devname);' inside clone_mnt area.")
+    print("❌ Cannot find alloc_vfsmnt(old->mnt_devname) in clone_mnt.")
     sys.exit(1)
+
 seg2 = seg.replace(needle2, clone_repl_block.strip("\n"), 1)
 txt = txt[:idx] + seg2 if idx >= 0 else seg2
 
 p.write_text(txt, encoding="utf-8")
 print("✅ Manual SusFS fixes applied to fs/namespace.c")
 PY
+
+          python3 /tmp/susfs_fix_namespace.py
 
           rm -f fs/namespace.c.rej
           echo "✅ Removed fs/namespace.c.rej after manual fix."
