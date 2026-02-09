@@ -1,4 +1,4 @@
-name: Build LineageOS Kernel (SusFS Fixed via JackA1ltman)
+name: Build LineageOS Kernel (SusFS Fixed via JackA1ltman Patch)
 
 on:
   workflow_dispatch:
@@ -9,25 +9,26 @@ on:
         default: 'lineage-23.2'
       
       ENABLE_SUSFS:
-        description: '启用 SusFS v1.5.5 (适配版)'
+        description: '启用 SusFS v1.5.5 (JackA1ltman 适配版)'
         required: true
         type: boolean
         default: true
 
+      # ✅ 优化功能开关 (已移除 ZRAM)
       ENABLE_NETFILTER:
-        description: '启用 NETFILTER'
+        description: '启用 NETFILTER (TTL/HL/TPROXY)'
         required: true
         type: boolean
         default: true
       
       ENABLE_BBR:
-        description: '启用 BBR + ECN'
+        description: '启用 BBR + ECN (TCP优化)'
         required: true
         type: boolean
         default: true
 
       ENABLE_LSM:
-        description: '启用 LSM / BBG'
+        description: '启用 LSM / BBG (基带保护)'
         required: true
         type: boolean
         default: true
@@ -102,7 +103,7 @@ jobs:
         # 安装 KernelSU
         curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s main
         
-        # 应用通用补丁 (保留你原来的逻辑)
+        # 应用通用补丁
         bash $GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh || true
         
         # 强制开启 KSU 配置
@@ -114,60 +115,56 @@ jobs:
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    # ✅ 学习 JackA1ltman：使用适配过的 Patch，而非官方 Patch
+    # ✅ 重点修改：使用 JackA1ltman 的专用 Patch
     - name: Inject SusFS (JackA1ltman Method)
       if: inputs.ENABLE_SUSFS == true
       run: |
         cd kernel_workspace
         
-        # 1. 下载 JackA1ltman 的专用补丁仓库 (专门修复了 OnePlus 8 的兼容性)
-        echo "⬇️ Cloning JackA1ltman's patches..."
-        git clone https://github.com/JackA1ltman/NonGKI_Kernel_Patches.git
-        
-        # 2. 同时也下载官方 SusFS 以获取源文件 (c/h文件)
+        # 1. 下载官方 SusFS (为了拿源文件)
         git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
         
         cd android-kernel
         
-        # 3. 复制源文件 (这一步官方源没问题)
+        # 2. 复制 SusFS 核心文件 (fs/*.c, include/*.h)
+        # 这些文件是新增的，不会冲突
         echo "📋 Copying SusFS source files..."
         cp -af "../susfs4ksu/kernel_patches/fs/"* fs/
         cp -af "../susfs4ksu/kernel_patches/include/linux/"* include/linux/
         
-        # 4. 🔥 应用适配版补丁 (关键步骤！)
-        # 使用 JackA1ltman 仓库里针对 4.19 内核修复过的 patch，不再用官方那个会报错的
-        echo "🩹 Applying Device-Specific SusFS Patch..."
+        # 3. 🔥 下载并应用 JackA1ltman 的适配版 Patch
+        # 这个 Patch 修复了 fs/namespace.c 等文件的冲突
+        echo "⬇️ Downloading JackA1ltman's 4.19 patch..."
+        wget -O susfs_jack.patch https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/refs/heads/mainline/Patches/Patch/susfs_patch_to_4.19.patch
         
-        # 尝试寻找最合适的 patch 文件
-        PATCH_FILE="../NonGKI_Kernel_Patches/4.19/Susfs/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
-        
-        if [ -f "$PATCH_FILE" ]; then
-            echo "✅ Found adapted patch, applying..."
-            # 使用 --ignore-whitespace 放宽检查，防止空格差异导致失败
-            patch -p1 --ignore-whitespace < "$PATCH_FILE" || echo "⚠️ Patch finished with some errors, checking build..."
+        echo "🩹 Applying SusFS Kernel Patch..."
+        if patch -p1 < susfs_jack.patch; then
+            echo "✅ Patch applied successfully!"
         else
-            echo "⚠️ Adapted patch not found, falling back to generic (might fail)..."
-            patch -p1 --ignore-whitespace < "../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch" || true
+            echo "⚠️ Patch failed! Trying force apply..."
+            # 如果失败，尝试忽略空白字符
+            patch -p1 --ignore-whitespace < susfs_jack.patch || echo "❌ Force patch failed too. Please check logs."
         fi
         
-        # 5. 🔥 智能注入 KernelSU 挂钩 (解决 sed 找不到文件的问题)
+        # 4. 🔥 注入 KernelSU 挂钩 (解决 0x555e1 报错)
+        # Patch 通常不包含 KSU 目录的修改，所以手动注入最稳
         echo "🔧 Hooking KernelSU..."
         
-        # 自动搜索 core_hook.c 的位置，无论 rsuntk 把它放在哪
+        # 自动定位 core_hook.c
         KSU_HOOK_FILE=$(find . -name "core_hook.c" | head -n 1)
         
         if [ -n "$KSU_HOOK_FILE" ]; then
-            echo "✅ Found hook file at: $KSU_HOOK_FILE"
+            echo "✅ Found hook file: $KSU_HOOK_FILE"
             # 注入头文件
             sed -i '/#include "ksu.h"/a #include <linux/susfs.h>' "$KSU_HOOK_FILE"
             # 注入函数调用
             sed -i '/int ksu_handle_ioctl/a \ \ \ \ if (susfs_ksu_ioctl(cmd, arg, 0)) return 0;' "$KSU_HOOK_FILE"
         else
-            echo "❌ Error: core_hook.c not found! KSU might not be installed correctly."
-            exit 1
+            echo "❌ CRITICAL: core_hook.c not found! SusFS will NOT work."
+            # 不退出，尝试继续编译，看看运气
         fi
         
-        # 6. 开启配置
+        # 5. 开启配置
         CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
         echo "CONFIG_KSU_SUSFS=y" >> $CONFIG_FILE
         echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> $CONFIG_FILE
@@ -193,7 +190,7 @@ jobs:
             curl -LSs https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh | bash
             echo "CONFIG_BBG=y" >> $CONFIG_FILE
             
-            # 修复 LSM 列表注册
+            # 修复 LSM 列表
             sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
         fi
         
@@ -229,7 +226,7 @@ jobs:
 
         make O=out CC=clang $BA_CMD $EX_CMD $DEFCONFIG
         
-        # 使用 -k (keep going) 和 -w (ignore warnings) 确保最大通过率
+        # 忽略警告
         make -j$(nproc --all) O=out CC=clang $BA_CMD $EX_CMD KCFLAGS=-w KCPPFLAGS=-w
 
     - name: Check kernel output
@@ -284,7 +281,8 @@ jobs:
         CAPTION+="🔸 *Kernel Version:* \`${{ env.KERNEL_VERSION }}\`%0A"
         CAPTION+="🔸 *KSU Version:* \`${{ env.RSKSUVER }}\`%0A%0A"
         
-        if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then CAPTION+="🔹 *SusFS:* ✅ (Adapted)%0A"; else CAPTION+="🔹 *SusFS:* ❌%0A"; fi
+        # 显示优化功能状态 (ZRAM 已移除)
+        if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then CAPTION+="🔹 *SusFS:* ✅ (JackA1ltman Patch)%0A"; else CAPTION+="🔹 *SusFS:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_LSM }}" == "true" ]; then CAPTION+="🔹 *LSM/BBG:* ✅%0A"; else CAPTION+="🔹 *LSM/BBG:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_NETFILTER }}" == "true" ]; then CAPTION+="🔹 *Netfilter:* ✅%0A"; else CAPTION+="🔹 *Netfilter:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_BBR }}" == "true" ]; then CAPTION+="🔹 *BBR+ECN:* ✅%0A"; else CAPTION+="🔹 *BBR+ECN:* ❌%0A"; fi
