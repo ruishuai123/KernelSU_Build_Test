@@ -14,7 +14,7 @@ on:
         type: boolean
         default: true
 
-      # ✅ 新增优化功能开关
+      # ✅ 优化功能开关 (已移除 ZRAM)
       ENABLE_NETFILTER:
         description: '启用 NETFILTER (TTL/HL/TPROXY)'
         required: true
@@ -23,12 +23,6 @@ on:
       
       ENABLE_BBR:
         description: '启用 BBR + ECN (TCP优化)'
-        required: true
-        type: boolean
-        default: true
-        
-      ENABLE_ZRAM:
-        description: '启用 ZRAM 优化 (LZ4)'
         required: true
         type: boolean
         default: true
@@ -114,7 +108,7 @@ jobs:
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    # SusFS 注入逻辑保持不变
+    # SusFS 注入逻辑
     - name: Inject SusFS (kernel-4.19)
       if: inputs.ENABLE_SUSFS == true
       run: |
@@ -144,7 +138,7 @@ jobs:
         echo "SUSFS_VERSION=kernel-4.19" >> $GITHUB_ENV
         echo "✅ SusFS injection process completed."
 
-    # ✅ 注入内核优化扩展 (只修复了 ZRAM 依赖部分)
+    # ✅ 注入内核优化扩展 (已移除 ZRAM)
     - name: Inject Kernel Extensions
       run: |
         cd kernel_workspace/android-kernel
@@ -176,18 +170,6 @@ jobs:
             echo "CONFIG_DEFAULT_BBR=y" >> $CONFIG_FILE
             echo "CONFIG_IP_ECN=y" >> $CONFIG_FILE
             echo "CONFIG_TCP_ECN=y" >> $CONFIG_FILE
-        fi
-        
-        # 4. ZRAM (LZ4) - 修复 LZ4 依赖缺失问题
-        if [ "${{ inputs.ENABLE_ZRAM }}" == "true" ]; then
-            echo "💾 Enabling ZRAM LZ4 (With Dependencies)..."
-            echo "CONFIG_ZRAM=y" >> $CONFIG_FILE
-            echo "CONFIG_ZRAM_WRITEBACK=y" >> $CONFIG_FILE
-            # 🔥 关键修复：开启底层 LZ4 压缩/解压库，否则 Crypto 模块会报错
-            echo "CONFIG_LZ4_COMPRESS=y" >> $CONFIG_FILE
-            echo "CONFIG_LZ4_DECOMPRESS=y" >> $CONFIG_FILE
-            echo "CONFIG_LZ4HC_COMPRESS=y" >> $CONFIG_FILE
-            echo "CONFIG_CRYPTO_LZ4=y" >> $CONFIG_FILE
         fi
 
     - name: Build kernel
@@ -259,12 +241,11 @@ jobs:
         CAPTION+="🔸 *Kernel Version:* \`${{ env.KERNEL_VERSION }}\`%0A"
         CAPTION+="🔸 *KSU Version:* \`${{ env.RSKSUVER }}\`%0A%0A"
         
-        # 显示优化功能状态
+        # 显示优化功能状态 (ZRAM 已移除)
         if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then CAPTION+="🔹 *SusFS:* ✅%0A"; else CAPTION+="🔹 *SusFS:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_LSM }}" == "true" ]; then CAPTION+="🔹 *LSM/BBG:* ✅%0A"; else CAPTION+="🔹 *LSM/BBG:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_NETFILTER }}" == "true" ]; then CAPTION+="🔹 *Netfilter:* ✅%0A"; else CAPTION+="🔹 *Netfilter:* ❌%0A"; fi
         if [ "${{ inputs.ENABLE_BBR }}" == "true" ]; then CAPTION+="🔹 *BBR+ECN:* ✅%0A"; else CAPTION+="🔹 *BBR+ECN:* ❌%0A"; fi
-        if [ "${{ inputs.ENABLE_ZRAM }}" == "true" ]; then CAPTION+="🔹 *ZRAM (LZ4):* ✅%0A"; else CAPTION+="🔹 *ZRAM:* ❌%0A"; fi
         
         curl -s -F chat_id=$TELEGRAM_CHAT_ID \
              -F document=@${{ env.ZIP_NAME }} \
