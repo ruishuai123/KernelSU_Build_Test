@@ -9,7 +9,7 @@ on:
         default: "lineage-23.2"
 
       ENABLE_SUSFS:
-        description: "启用 SusFS v1.5.5 (稳定版)"
+        description: "启用 SusFS (使用 rsuntk/KernelSU susfs-rksu-master)"
         required: true
         type: boolean
         default: true
@@ -117,83 +117,59 @@ jobs:
             https://github.com/LineageOS/android_kernel_oneplus_sm8250 \
             android-kernel
 
-      - name: Set up KernelSU (rsuntk)
+      - name: Set up KernelSU (rsuntk; auto susfs branch)
         shell: bash
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
-          # rsuntk KernelSU
-          curl -LSs --retry 5 --retry-delay 2 \
+          KSU_REF="main"
+          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
+            KSU_REF="susfs-rksu-master"
+          fi
+          echo "Using KernelSU ref: $KSU_REF"
+
+          curl -fLsS --retry 5 --retry-delay 2 \
             https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh \
-            | bash -s main
+            | bash -s "$KSU_REF"
 
           # 你的 patches 可选（不存在也不硬失败）
           bash "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" || true
 
-          # 手动 hook（你原本就有）
+          # Non-GKI 默认 manual hook
           echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/vendor/kona-perf_defconfig
 
-          # version
-          RSKSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
+          # 如果开启 SusFS，则把 SusFS 相关开关写入 defconfig
+          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
+            CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
+            {
+              echo "CONFIG_KSU_SUSFS=y"
+              echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+              echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y"
+              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+              echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+              echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+              echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            } >> "$CONFIG_FILE"
+            echo "SUSFS_VERSION=rsuntk-susfs-rksu-master" >> "$GITHUB_ENV"
+          fi
+
+          # version（尽量算，算不到就给个占位）
+          if [ -d KernelSU/.git ]; then
+            RSKSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
+          else
+            RSKSUVER=30000
+          fi
           echo "RSKSUVER=$RSKSUVER" >> "$GITHUB_ENV"
 
           # remove -dirty
           sed -i 's/ -dirty//g' scripts/setlocalversion
-
-      - name: Inject SusFS (REAL patch, kernel-4.19)
-        if: inputs.ENABLE_SUSFS == true
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace"
-
-          echo "⬇️ Cloning SusFS (kernel-4.19 branch)..."
-          git clone --depth=1 -b kernel-4.19 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
-          SUSFS_DIR="$GITHUB_WORKSPACE/kernel_workspace/susfs4ksu"
-          KERNEL_DIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-
-          # 1) copy fs/ + include/linux/
-          echo "📋 Copying SusFS fs/ + include/linux/ ..."
-          cp -af "${SUSFS_DIR}/kernel_patches/fs/." "${KERNEL_DIR}/fs/"
-          cp -af "${SUSFS_DIR}/kernel_patches/include/linux/." "${KERNEL_DIR}/include/linux/"
-
-          # 2) apply patch to KernelSU
-          echo "🩹 Patching KernelSU for SusFS ..."
-          cp -af "${SUSFS_DIR}/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" "${KERNEL_DIR}/KernelSU/"
-          (cd "${KERNEL_DIR}/KernelSU" && patch -p1 < 10_enable_susfs_for_ksu.patch)
-
-          # 3) apply patch to kernel (4.19)
-          echo "🩹 Patching kernel for SusFS (4.19) ..."
-          cp -af "${SUSFS_DIR}/kernel_patches/50_add_susfs_in_kernel-4.19.patch" "${KERNEL_DIR}/"
-          (cd "${KERNEL_DIR}" && patch -p1 < 50_add_susfs_in_kernel-4.19.patch)
-
-          # 4) enable configs
-          CONFIG_FILE="${KERNEL_DIR}/arch/arm64/configs/vendor/kona-perf_defconfig"
-          {
-            echo "CONFIG_KSU_SUSFS=y"
-            echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y"
-            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
-            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
-            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
-            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-          } >> "$CONFIG_FILE"
-
-          echo "SUSFS_VERSION=kernel-4.19" >> "$GITHUB_ENV"
-
-          # ✅ 更稳增强 1：硬校验（没打进去就直接失败）
-          echo "🔍 Verifying SusFS patches are really applied..."
-          grep -q 'obj-\$(CONFIG_KSU_SUSFS) \+= susfs.o' "${KERNEL_DIR}/fs/Makefile"
-          grep -q 'susfs_init' "${KERNEL_DIR}/KernelSU/kernel/ksu.c" || grep -q 'susfs_init' "${KERNEL_DIR}/KernelSU/kernel/ksu.c" || true
-          test -f "${KERNEL_DIR}/include/linux/susfs.h"
-          echo "✅ SusFS patch verification passed."
 
       - name: Inject Kernel Extensions
         shell: bash
@@ -205,7 +181,7 @@ jobs:
           # 1) LSM / Baseband Guard
           if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then
             echo "🛡️ Setting up Baseband Guard (LSM)..."
-            curl -LSs --retry 5 --retry-delay 2 \
+            curl -fLsS --retry 5 --retry-delay 2 \
               https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh \
               | bash
             echo "CONFIG_BBG=y" >> "$CONFIG_FILE"
@@ -255,9 +231,10 @@ jobs:
           make O=out CC=clang $BA_CMD $EX_CMD $DEFCONFIG
           make -j"$(nproc --all)" O=out CC=clang $BA_CMD $EX_CMD
 
-          # ✅ 更稳增强 2：编译后再校验最终 .config 里确实启用（避免 defconfig 追加没被合进去）
+          # ✅ 必须校验：避免“编译过了但刷机 /proc/config.gz 没有 KSU_SUSFS”
           if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
-            grep -q '^CONFIG_KSU_SUSFS=y' out/.config
+            echo "==== SusFS config check (out/.config) ===="
+            grep -nE '^CONFIG_KSU_SUSFS=y' out/.config
             echo "✅ out/.config confirms CONFIG_KSU_SUSFS=y"
           fi
 
