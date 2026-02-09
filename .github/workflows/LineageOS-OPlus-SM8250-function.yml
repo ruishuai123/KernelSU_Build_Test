@@ -100,7 +100,13 @@ jobs:
       run: |
         cd kernel_workspace/android-kernel
 
-        curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s main
+        # ✅ SusFS 开启时使用兼容分支，避免主分支缺少 SusFS 相关改动导致构建失败
+        if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
+          curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s susfs-rksu-master
+        else
+          curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s main
+        fi
+
         bash $GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh || true
         echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/vendor/kona-perf_defconfig
         RSKSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
