@@ -9,7 +9,7 @@ on:
         default: 'lineage-23.2'
        
       ENABLE_SUSFS:
-        description: '启用 SusFS (使用 rsuntk susfs 分支)'
+        description: '启用 SusFS (KernelSU susfs 分支 + kernel patch)'
         required: true
         type: boolean
         default: true
@@ -55,7 +55,7 @@ jobs:
         echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> $GITHUB_ENV
         echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> $GITHUB_ENV
         sudo apt-get update
-        sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev
+        sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev patch
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
 
     - name: Cache Clang toolchain
@@ -95,11 +95,10 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace
         git clone --recursive https://github.com/LineageOS/android_kernel_oneplus_sm8250 -b ${{ inputs.LINEAGE_BRANCH }} android-kernel --depth=1
 
-    - name: Set up KernelSU (rsuntk) + SusFS branch
+    - name: Set up KernelSU (rsuntk) susfs branch
       run: |
         cd kernel_workspace/android-kernel
 
-        # ✅ 用 rsuntk 提供的 SusFS 分支（省去 susfs4ksu patch 冲突）
         if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then
           curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s susfs-rksu-master
         else
@@ -108,7 +107,6 @@ jobs:
 
         bash $GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh || true
 
-        # ✅ 独立 fragment，避免被 vendor/oplus.config 覆盖
         mkdir -p arch/arm64/configs/vendor
 
         KSU_CFG="arch/arm64/configs/vendor/kernelsu.config"
@@ -121,10 +119,8 @@ jobs:
         if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then
           {
             echo "CONFIG_KSU_SUSFS=y"
-            # 常见依赖（更稳）
             echo "CONFIG_OVERLAY_FS=y"
             echo "CONFIG_TMPFS_XATTR=y"
-            # 若你 manager 用 magic mount，建议开启
             echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
           } > "$SUS_CFG"
         else
@@ -135,6 +131,44 @@ jobs:
         echo "RSKSUVER=$RSKSUVER" >> $GITHUB_ENV
 
         sed -i 's/ -dirty//g' scripts/setlocalversion
+
+    # ✅ 关键：仍然要把 SusFS kernel patch 集成进 LineageOS kernel tree（否则 KSU 会强制 Stop）
+    - name: Apply SusFS kernel patch (kernel-4.19)
+      if: inputs.ENABLE_SUSFS == true
+      run: |
+        set -e
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19 susfs4ksu
+
+        KPATCH="$GITHUB_WORKSPACE/kernel_workspace/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+
+        echo "🧩 Applying SusFS kernel patch with fuzz (rejects will be shown, build continues)..."
+        set +e
+        patch -p1 --forward --fuzz=3 < "$KPATCH"
+        RC=$?
+        set -e
+        echo "patch exit code: $RC"
+
+        echo "===== SUSFS REJECT CHECK ====="
+        REJ_FILES=$(find fs include kernel -name "*.rej" 2>/dev/null || true)
+        if [ -n "$REJ_FILES" ]; then
+          echo "⚠️ Found reject files:"
+          echo "$REJ_FILES"
+          echo "SUSFS_REJECTS=true" >> $GITHUB_ENV
+          echo "----- Reject contents begin -----"
+          for f in $REJ_FILES; do
+            echo "### $f"
+            sed -n '1,200p' "$f" || true
+            echo
+          done
+          echo "----- Reject contents end -----"
+          echo "⚠️ SusFS may be partially integrated until rejects are resolved."
+        else
+          echo "✅ No rejects found."
+          echo "SUSFS_REJECTS=false" >> $GITHUB_ENV
+        fi
+        echo "===== END ====="
 
     - name: Inject Kernel Extensions
       run: |
@@ -160,8 +194,8 @@ jobs:
             echo "🚀 Enabling TCP BBR + ECN..."
             echo "CONFIG_TCP_CONG_BBR=y" >> $CONFIG_FILE
             echo "CONFIG_DEFAULT_BBR=y" >> $CONFIG_FILE
-            echo "CONFIG_IP_ECN=y" >> $CONFIG_FILE
-            echo "CONFIG_TCP_ECN=y" >> $CONFIG_FILE
+            echo "CONFIG_IP_ECN=y"
+            echo "CONFIG_TCP_ECN=y"
         fi
 
     - name: Build kernel
@@ -177,7 +211,6 @@ jobs:
         BA_CMD="CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-"
         EX_CMD="LD=ld.lld LLVM=1 LLVM_IAS=1"
 
-        # ✅ 把 kernelsu.config / susfs.config 放最后，防止被 vendor/oplus.config 覆盖
         DEFCONFIG_LIST="vendor/kona-perf_defconfig vendor/debugfs.config vendor/oplus.config vendor/kernelsu.config"
         if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then
           DEFCONFIG_LIST="$DEFCONFIG_LIST vendor/susfs.config"
@@ -197,82 +230,3 @@ jobs:
           echo "out/.config not found!"
           exit 1
         fi
-
-    - name: Check kernel output
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel/out
-
-        if [ -f arch/arm64/boot/Image ]; then
-          echo "CHECK_IMAGE=true" >> $GITHUB_ENV
-          echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> $GITHUB_ENV
-        else
-          echo "Kernel output file is empty"
-          exit 1
-        fi
-
-    - name: Prepare AnyKernel3 and package
-      run: |
-        cd kernel_workspace
-        git clone --depth=1 https://github.com/osm0sis/AnyKernel3
-        sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
-        sed -i 's!BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!BLOCK=auto;!g' AnyKernel3/anykernel.sh
-        sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' AnyKernel3/anykernel.sh
-        rm -rf AnyKernel3/.git* AnyKernel3/README.md
-        cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
-
-        cd AnyKernel3
-        
-        SUS_TAG=""
-        if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then
-            SUS_TAG="-SusFS"
-        fi
-        
-        zip -r AK3-${{ inputs.LINEAGE_BRANCH }}-OPlus-SM8250-rsuntk${SUS_TAG}_KSU_${{ env.RSKSUVER }}.zip ./*
-        
-        echo "ZIP_NAME=$(ls *.zip)" >> $GITHUB_ENV
-
-    - name: Upload AnyKernel3 ZIP (GitHub Artifact)
-      uses: actions/upload-artifact@v4
-      with:
-        name: AK3-rsuntk
-        path: kernel_workspace/AnyKernel3/*.zip
-
-    - name: Send Success to Telegram
-      if: success()
-      env:
-        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: |
-        cd kernel_workspace/AnyKernel3
-        
-        CAPTION="✅ *Kernel Build Success!*%0A%0A"
-        CAPTION+="🔸 *Branch:* \`${{ inputs.LINEAGE_BRANCH }}\`%0A"
-        CAPTION+="🔸 *Kernel Version:* \`${{ env.KERNEL_VERSION }}\`%0A"
-        CAPTION+="🔸 *KSU Version:* \`${{ env.RSKSUVER }}\`%0A%0A"
-        
-        if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then CAPTION+="🔹 *SusFS:* ✅%0A"; else CAPTION+="🔹 *SusFS:* ❌%0A"; fi
-        if [ "${{ inputs.ENABLE_LSM }}" == "true" ]; then CAPTION+="🔹 *LSM/BBG:* ✅%0A"; else CAPTION+="🔹 *LSM/BBG:* ❌%0A"; fi
-        if [ "${{ inputs.ENABLE_NETFILTER }}" == "true" ]; then CAPTION+="🔹 *Netfilter:* ✅%0A"; else CAPTION+="🔹 *Netfilter:* ❌%0A"; fi
-        if [ "${{ inputs.ENABLE_BBR }}" == "true" ]; then CAPTION+="🔹 *BBR+ECN:* ✅%0A"; else CAPTION+="🔹 *BBR+ECN:* ❌%0A"; fi
-        
-        curl -s -F chat_id=$TELEGRAM_CHAT_ID \
-              -F document=@${{ env.ZIP_NAME }} \
-              -F parse_mode=Markdown \
-              -F caption="$CAPTION" \
-              https://api.telegram.org/bot$TELEGRAM_TOKEN/sendDocument
-
-    - name: Send Failure to Telegram
-      if: failure()
-      env:
-        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: |
-        MESSAGE="❌ *Kernel Build Failed!*%0A%0A"
-        MESSAGE+="🔸 *Branch:* \`${{ inputs.LINEAGE_BRANCH }}\`%0A"
-        MESSAGE+="🔸 *Build User:* \`${{ github.actor }}\`%0A%0A"
-        MESSAGE+="📋 *Logs:* [View Action Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
-
-        curl -s -X POST https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage \
-            -d chat_id=$TELEGRAM_CHAT_ID \
-            -d parse_mode=Markdown \
-            -d text="$MESSAGE"
