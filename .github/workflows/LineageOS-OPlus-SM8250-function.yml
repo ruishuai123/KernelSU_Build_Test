@@ -1,4 +1,4 @@
-name: Build LineageOS Kernel (rsuntk + SusFS)
+name: Build LineageOS Kernel (SusFS Fix)
 
 on:
   workflow_dispatch:
@@ -108,8 +108,8 @@ jobs:
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    # SusFS 注入逻辑
-    - name: Inject SusFS (kernel-4.19)
+    # ✅ SusFS 修复逻辑：除了复制文件，增加 Patch 操作！
+    - name: Inject SusFS (Patching)
       if: inputs.ENABLE_SUSFS == true
       run: |
         cd kernel_workspace
@@ -120,10 +120,29 @@ jobs:
         
         cd android-kernel
         
+        # 1. 复制文件 (你之前的步骤)
         echo "📋 Copying SusFS files from kernel_patches..."
         cp -af "${SUSFS_DIR}/kernel_patches/fs/"* fs/
         cp -af "${SUSFS_DIR}/kernel_patches/include/linux/"* include/linux/
         
+        # 2. 🔥 应用内核补丁 (解决 Error 2: sub-make)
+        echo "🩹 Applying SusFS Kernel Patch..."
+        if [ -f "${SUSFS_DIR}/kernel_patches/50_add_susfs_in_kernel-4.19.patch" ]; then
+            patch -p1 < "${SUSFS_DIR}/kernel_patches/50_add_susfs_in_kernel-4.19.patch" || echo "⚠️ Kernel patch failed or already applied"
+        fi
+        
+        # 3. 🔥🔥 应用 KernelSU 补丁 (解决 0x555e1 报错)
+        # rsuntk 必须打这个补丁才能认识 SusFS 指令
+        echo "🩹 Applying SusFS KernelSU Patch..."
+        if [ -f "${SUSFS_DIR}/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+            cd KernelSU
+            patch -p1 < "${SUSFS_DIR}/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || echo "⚠️ KSU patch failed, check version"
+            cd ..
+        else
+             echo "⚠️ Patch file not found, skipping..."
+        fi
+        
+        # 4. 开启配置
         CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
         echo "🔧 Enabling SusFS Configs..."
         echo "CONFIG_KSU_SUSFS=y" >> $CONFIG_FILE
@@ -138,7 +157,7 @@ jobs:
         echo "SUSFS_VERSION=kernel-4.19" >> $GITHUB_ENV
         echo "✅ SusFS injection process completed."
 
-    # ✅ 注入内核优化扩展 (已移除 ZRAM)
+    # ✅ 注入内核优化扩展 (ZRAM 已移除，保留修复好的 LSM)
     - name: Inject Kernel Extensions
       run: |
         cd kernel_workspace/android-kernel
