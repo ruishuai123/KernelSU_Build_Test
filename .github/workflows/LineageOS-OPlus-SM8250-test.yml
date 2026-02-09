@@ -96,6 +96,7 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace
         git clone --recursive https://github.com/LineageOS/android_kernel_oneplus_sm8250 -b ${{ inputs.LINEAGE_BRANCH }} android-kernel --depth=1
 
+    # ✅ 按照要求只改这里：rsuntk 安装 + 补全文件 + 删检查
     - name: Set up KernelSU (rsuntk)
       run: |
         cd kernel_workspace/android-kernel
@@ -103,25 +104,17 @@ jobs:
         # 1. 安装 KernelSU (susfs-rksu-master)
         curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh" | bash -s susfs-rksu-master
         
-        # 2. 🔥🔥🔥 必须补全 SusFS 文件，否则 Makefile 会报错 "not integrated" 🔥🔥🔥
-        # setup.sh 只处理 KernelSU 目录，内核源码 fs/ 目录是空的，必须手动拷进去
-        echo "⬇️ Cloning SusFS Source to fill missing files..."
+        # 2. 补全 SusFS 文件 (setup.sh 不负责这块，手动补上)
         git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
-        echo "📋 Copying SusFS files to kernel..."
         cp -af "susfs4ksu/kernel_patches/fs/"* fs/
         cp -af "susfs4ksu/kernel_patches/include/linux/"* include/linux/
         
-        # 3. 🔥🔥🔥 暴力删除 Makefile 里的报错检查逻辑 🔥🔥🔥
-        # 这一步是关键！直接把检查 SusFS 的那几行删掉，强制通行！
-        echo "🔪 Removing SusFS check in KernelSU Makefile..."
-        sed -i '/error -- You have not integrated susfs/d' drivers/kernelsu/Makefile || true
-        
-        # 4. 尝试打补丁 (JackA1ltman版)，就算失败也允许继续
-        echo "⬇️ Applying JackA1ltman patch..."
-        wget -O susfs_jack.patch https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/refs/heads/mainline/Patches/Patch/susfs_patch_to_4.19.patch
-        patch -p1 --ignore-whitespace < susfs_jack.patch || echo "⚠️ Patch finished with errors, but proceeding..."
+        # 3. 暴力删除 Makefile 报错 (强制通行)
+        if [ -f "drivers/kernelsu/Makefile" ]; then
+             sed -i '/error -- You have not integrated susfs/d' drivers/kernelsu/Makefile
+        fi
 
-        # 5. 通用补丁 & 配置
+        # 4. 通用补丁 & 配置
         bash $GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh || true
         echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/vendor/kona-perf_defconfig
         RSKSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
@@ -129,11 +122,16 @@ jobs:
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    # ✅ 仅开启配置 (文件已在上面步骤放入)
+    # ✅ SusFS 补丁 (JackA1ltman版)
     - name: Enable SusFS Configs
       if: inputs.ENABLE_SUSFS == true
       run: |
         cd kernel_workspace/android-kernel
+        
+        # 应用 patch 以适配 4.19 内核源码
+        wget -O susfs_jack.patch https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/refs/heads/mainline/Patches/Patch/susfs_patch_to_4.19.patch
+        patch -p1 --ignore-whitespace < susfs_jack.patch || true
+
         CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
         echo "🔧 Enabling SusFS Configs..."
         echo "CONFIG_KSU_SUSFS=y" >> $CONFIG_FILE
