@@ -242,6 +242,29 @@ jobs:
           rm -f fs/namespace.c.rej
           echo "✅ Removed fs/namespace.c.rej after manual fix."
         fi
+
+        echo "🩹 Applying SusFS compatibility fixes for 4.19 trees..."
+        if ! rg -n "get_cred_rcu\(" include/linux/cred.h >/dev/null; then
+          echo "→ inject get_cred_rcu() into include/linux/cred.h"
+          awk '1; /static inline void put_cred\(const struct cred \*cred\)/ && !done {
+            while ((getline line < ENVIRON["GITHUB_WORKSPACE"] "/patches/get_cred_rcu.h") > 0) print line;
+            done=1
+          }' include/linux/cred.h > /tmp/cred.h && mv /tmp/cred.h include/linux/cred.h
+        fi
+
+        if ! rg -n "int path_umount\(" fs/namespace.c >/dev/null; then
+          echo "→ inject can_umount()/path_umount() into fs/namespace.c"
+          awk '1; /SYSCALL_DEFINE2\(umount, char __user \*, name, int, flags\)/ && !done {
+            while ((getline line < ENVIRON["GITHUB_WORKSPACE"] "/patches/path_umount.c") > 0) print line;
+            done=1
+          }' fs/namespace.c > /tmp/namespace.c && mv /tmp/namespace.c fs/namespace.c
+        fi
+
+        if find . -name "*.rej" -print | grep -q .; then
+          echo "❌ SusFS patch left reject files, aborting build:"
+          find . -name "*.rej" -print
+          exit 1
+        fi
         
         CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
         echo "🔧 Enabling SusFS Configs..."
