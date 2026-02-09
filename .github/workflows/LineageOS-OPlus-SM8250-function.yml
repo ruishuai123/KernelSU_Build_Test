@@ -114,7 +114,7 @@ jobs:
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    # SusFS 注入逻辑
+    # SusFS 注入逻辑保持不变
     - name: Inject SusFS (kernel-4.19)
       if: inputs.ENABLE_SUSFS == true
       run: |
@@ -144,20 +144,19 @@ jobs:
         echo "SUSFS_VERSION=kernel-4.19" >> $GITHUB_ENV
         echo "✅ SusFS injection process completed."
 
-    # ✅ 注入内核优化扩展 (修复 LSM 和 ZRAM 报错)
+    # ✅ 注入内核优化扩展 (只修复了 ZRAM 依赖部分)
     - name: Inject Kernel Extensions
       run: |
         cd kernel_workspace/android-kernel
         CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
         
-        # 1. LSM / Baseband Guard (修复 CONFIG_LSM 列表问题)
+        # 1. LSM / Baseband Guard
         if [ "${{ inputs.ENABLE_LSM }}" == "true" ]; then
             echo "🛡️ Setting up Baseband Guard (LSM)..."
             curl -LSs https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh | bash
             echo "CONFIG_BBG=y" >> $CONFIG_FILE
             
-            # 🔥 关键修复：将 baseband_guard 加入 security/Kconfig 的默认 LSM 列表
-            # 如果不加这行，编译时会报 "BBG not enable in CONFIG_LSM" 并停止
+            # 关键修复：将 baseband_guard 加入 security/Kconfig 的默认 LSM 列表
             sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
         fi
         
