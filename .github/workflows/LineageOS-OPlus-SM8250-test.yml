@@ -56,7 +56,7 @@ jobs:
         echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> $GITHUB_ENV
         echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> $GITHUB_ENV
         sudo apt-get update
-        sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev
+        sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev patch
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
 
     - name: Cache Clang toolchain
@@ -103,7 +103,7 @@ jobs:
         curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s main
         bash $GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh || true
 
-        # ✅ 不再直接写进 kona-perf_defconfig，改为独立 fragment，避免被后续 config 覆盖
+        # ✅ 独立 fragment，避免被后续 config 覆盖
         KSU_CFG="arch/arm64/configs/vendor/kernelsu.config"
         mkdir -p arch/arm64/configs/vendor
         {
@@ -116,38 +116,60 @@ jobs:
         
         sed -i 's/ -dirty//g' scripts/setlocalversion
 
-    # SusFS 注入逻辑（修正版：优先打 patch，其次才 copy）
+    # SusFS 注入逻辑（修正版：对内核/KernelSU分别正确打补丁，并使用 3way+fuzz 容错）
     - name: Inject SusFS (kernel-4.19)
       if: inputs.ENABLE_SUSFS == true
       run: |
+        set -e
         cd kernel_workspace
         echo "⬇️ Cloning SusFS (kernel-4.19 branch)..."
         git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
 
         SUSFS_DIR="$(pwd)/susfs4ksu"
-        cd android-kernel
+        KERNEL_DIR="$(pwd)/android-kernel"
 
-        echo "🧩 Trying to apply SusFS patches (preferred)..."
-        set +e
-        PATCH_COUNT=$(find "$SUSFS_DIR" -type f \( -name "*.patch" -o -name "*.diff" \) | wc -l)
-        set -e
+        echo "===== SusFS DIR: $SUSFS_DIR ====="
+        echo "===== Kernel DIR: $KERNEL_DIR ====="
 
-        if [ "$PATCH_COUNT" -gt 0 ]; then
-          echo "✅ Found patch files: $PATCH_COUNT"
-          # 尝试按顺序应用所有 patch（如果某些已应用/不适配会失败，直接停掉让你看到日志）
-          find "$SUSFS_DIR" -type f \( -name "*.patch" -o -name "*.diff" \) -print0 | sort -z | xargs -0 -I{} bash -c 'echo "Applying {}"; git apply --whitespace=nowarn "{}"'
-          echo "✅ SusFS patches applied."
-        else
-          echo "⚠️ No patch files found, fallback to copying kernel_patches (may be incomplete depending on upstream)."
-          if [ -d "${SUSFS_DIR}/kernel_patches/fs" ]; then
-            cp -af "${SUSFS_DIR}/kernel_patches/fs/"* fs/
-          fi
-          if [ -d "${SUSFS_DIR}/kernel_patches/include/linux" ]; then
-            cp -af "${SUSFS_DIR}/kernel_patches/include/linux/"* include/linux/
-          fi
+        KPATCH="$SUSFS_DIR/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
+        KSU_PATCH="$SUSFS_DIR/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+
+        if [ ! -f "$KPATCH" ]; then
+          echo "❌ Kernel patch not found: $KPATCH"
+          exit 1
+        fi
+        if [ ! -f "$KSU_PATCH" ]; then
+          echo "❌ KernelSU patch not found: $KSU_PATCH"
+          exit 1
         fi
 
-        # ✅ SusFS 配置改为独立 fragment，且会在最终 DEFCONFIG 列表最后加入，避免被覆盖
+        # 1) 对 LineageOS kernel tree 应用 SusFS kernel patch
+        echo "🧩 Applying SusFS kernel patch to android-kernel..."
+        cd "$KERNEL_DIR"
+
+        if git apply --3way --whitespace=nowarn "$KPATCH"; then
+          echo "✅ Kernel patch applied via git apply --3way"
+        else
+          echo "⚠️ git apply --3way failed, trying GNU patch with fuzz..."
+          # --forward: 已应用则跳过；--fuzz=3: 允许上下文偏移；失败就终止（否则做出来还是没 SusFS）
+          patch -p1 --forward --fuzz=3 < "$KPATCH"
+          echo "✅ Kernel patch applied via patch --fuzz=3"
+        fi
+
+        # 2) 对 KernelSU repo 应用 enable patch（注意路径：android-kernel/KernelSU）
+        echo "🧩 Applying SusFS KernelSU patch to android-kernel/KernelSU..."
+        cd "$KERNEL_DIR/KernelSU"
+
+        if git apply --3way --whitespace=nowarn "$KSU_PATCH"; then
+          echo "✅ KernelSU patch applied via git apply --3way"
+        else
+          echo "⚠️ git apply --3way failed, trying GNU patch with fuzz..."
+          patch -p1 --forward --fuzz=3 < "$KSU_PATCH"
+          echo "✅ KernelSU patch applied via patch --fuzz=3"
+        fi
+
+        # 3) SusFS 配置用独立 fragment，避免被 vendor/oplus.config 覆盖
+        cd "$KERNEL_DIR"
         SUS_CFG="arch/arm64/configs/vendor/susfs.config"
         mkdir -p arch/arm64/configs/vendor
         {
@@ -159,10 +181,10 @@ jobs:
           echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y"
           echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
           echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-          # 常见依赖（不一定缺，但开了更稳）
+          # 常见依赖（更稳）
           echo "CONFIG_OVERLAY_FS=y"
           echo "CONFIG_TMPFS_XATTR=y"
-          # 如果你用的是 magic mount（不少 KSU 管理器默认/推荐），建议打开
+          # 若你管理器使用 magic mount，建议启用
           echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
         } > "$SUS_CFG"
 
@@ -216,7 +238,7 @@ jobs:
         BA_CMD="CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-"
         EX_CMD="LD=ld.lld LLVM=1 LLVM_IAS=1"
 
-        # ✅ 关键修复：把 kernelsu.config / susfs.config 放到最后，防止被 vendor/oplus.config 覆盖
+        # ✅ kernelsu.config / susfs.config 放最后，防止被 vendor/oplus.config 覆盖
         DEFCONFIG_LIST="vendor/kona-perf_defconfig vendor/debugfs.config vendor/oplus.config vendor/kernelsu.config"
         if [ "${{ inputs.ENABLE_SUSFS }}" == "true" ]; then
           DEFCONFIG_LIST="$DEFCONFIG_LIST vendor/susfs.config"
