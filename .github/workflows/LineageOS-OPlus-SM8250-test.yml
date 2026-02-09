@@ -138,106 +138,105 @@ jobs:
         if [ -f fs/namespace.c.rej ]; then
           echo "⚠️ Found fs/namespace.c.rej, applying manual fix..."
 
-          # 写入 python 脚本文件，避免 YAML/HereDoc 解析问题
           cat > /tmp/susfs_fix_namespace.py <<'PY'
-import re, pathlib, sys
-
-p = pathlib.Path("fs/namespace.c")
-txt = p.read_text(encoding="utf-8", errors="ignore")
-
-# 1) vfs_kern_mount: replace alloc_vfsmnt(name);
-vfs_pat = re.compile(
-    r"(vfs_kern_mount\s*\(.*?\)\s*\{.*?)(\n\s*mnt\s*=\s*alloc_vfsmnt\s*\(\s*name\s*\)\s*;\s*\n)",
-    re.S
-)
-
-vfs_repl_block = r"""
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-	// For newly created mounts, the only caller process we care is KSU
-	if (unlikely(susfs_is_current_ksu_domain())) {
-		mnt = alloc_vfsmnt(name, true, 0);
-		goto bypass_orig_flow;
-	}
-	mnt = alloc_vfsmnt(name, false, 0);
-bypass_orig_flow:
-#else
-	mnt = alloc_vfsmnt(name);
-#endif
-"""
-
-m = vfs_pat.search(txt)
-if not m:
-    needle = "mnt = alloc_vfsmnt(name);"
-    if needle in txt:
-        txt = txt.replace(needle, vfs_repl_block.strip("\n"), 1)
-    else:
-        print("❌ Cannot find alloc_vfsmnt(name) in vfs_kern_mount.")
-        sys.exit(1)
-else:
-    txt = vfs_pat.sub(lambda mm: mm.group(1) + "\n" + vfs_repl_block + "\n", txt, count=1)
-
-# 2) clone_mnt: replace alloc_vfsmnt(old->mnt_devname);
-clone_sig = re.search(r"static\s+struct\s+mount\s*\*\s*clone_mnt\s*\(([^)]*)\)\s*\{", txt, re.S)
-if not clone_sig:
-    print("❌ Cannot find clone_mnt signature.")
-    sys.exit(1)
-
-params = clone_sig.group(1).strip()
-last_param = params.split(",")[-1].strip()
-var_name = re.split(r"\s+", last_param)[-1].replace("*", "").strip() or "flag"
-
-clone_repl_block = f"""
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-	bool is_current_ksu_domain = susfs_is_current_ksu_domain();
-	bool is_current_zygote_domain = susfs_is_current_zygote_domain();
-
-	// KSU process handling
-	if (unlikely(is_current_ksu_domain)) {{
-		if (!({var_name} & CL_COPY_MNT_NS)) {{
-			mnt = alloc_vfsmnt(old->mnt_devname, true, 0);
-			goto bypass_orig_flow;
-		}}
-		mnt = alloc_vfsmnt(old->mnt_devname, true, old->mnt_id);
-		if (mnt) {{
-			mnt->mnt.susfs_mnt_id_backup = DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE;
-		}}
-		goto bypass_orig_flow;
-	}}
-
-	// zygote handling for sus mounts
-	if (likely(is_current_zygote_domain) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {{
-		mnt = alloc_vfsmnt(old->mnt_devname, true, 0);
-		goto bypass_orig_flow;
-	}}
-
-	// other unshare handling
-	if (({var_name} & CL_COPY_MNT_NS) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {{
-		mnt = alloc_vfsmnt(old->mnt_devname, true, 0);
-		goto bypass_orig_flow;
-	}}
-
-	mnt = alloc_vfsmnt(old->mnt_devname, false, 0);
-bypass_orig_flow:
-#else
-	mnt = alloc_vfsmnt(old->mnt_devname);
-#endif
-"""
-
-idx = txt.find("static struct mount *clone_mnt")
-seg = txt[idx:] if idx >= 0 else txt
-needle2 = "mnt = alloc_vfsmnt(old->mnt_devname);"
-pos = seg.find(needle2)
-if pos < 0:
-    print("❌ Cannot find alloc_vfsmnt(old->mnt_devname) in clone_mnt.")
-    sys.exit(1)
-
-seg2 = seg.replace(needle2, clone_repl_block.strip("\n"), 1)
-txt = txt[:idx] + seg2 if idx >= 0 else seg2
-
-p.write_text(txt, encoding="utf-8")
-print("✅ Manual SusFS fixes applied to fs/namespace.c")
-PY
-
+          import re, pathlib, sys
+          
+          p = pathlib.Path("fs/namespace.c")
+          txt = p.read_text(encoding="utf-8", errors="ignore")
+          
+          # 1) vfs_kern_mount: replace alloc_vfsmnt(name);
+          vfs_pat = re.compile(
+              r"(vfs_kern_mount\s*\(.*?\)\s*\{.*?)(\n\s*mnt\s*=\s*alloc_vfsmnt\s*\(\s*name\s*\)\s*;\s*\n)",
+              re.S
+          )
+          
+          vfs_repl_block = r"""
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          	// For newly created mounts, the only caller process we care is KSU
+          	if (unlikely(susfs_is_current_ksu_domain())) {
+          		mnt = alloc_vfsmnt(name, true, 0);
+          		goto bypass_orig_flow;
+          	}
+          	mnt = alloc_vfsmnt(name, false, 0);
+          bypass_orig_flow:
+          #else
+          	mnt = alloc_vfsmnt(name);
+          #endif
+          """
+          
+          m = vfs_pat.search(txt)
+          if not m:
+              needle = "mnt = alloc_vfsmnt(name);"
+              if needle in txt:
+                  txt = txt.replace(needle, vfs_repl_block.strip("\n"), 1)
+              else:
+                  print("❌ Cannot find alloc_vfsmnt(name) in vfs_kern_mount.")
+                  sys.exit(1)
+          else:
+              txt = vfs_pat.sub(lambda mm: mm.group(1) + "\n" + vfs_repl_block + "\n", txt, count=1)
+          
+          # 2) clone_mnt: replace alloc_vfsmnt(old->mnt_devname);
+          clone_sig = re.search(r"static\s+struct\s+mount\s*\*\s*clone_mnt\s*\(([^)]*)\)\s*\{", txt, re.S)
+          if not clone_sig:
+              print("❌ Cannot find clone_mnt signature.")
+              sys.exit(1)
+          
+          params = clone_sig.group(1).strip()
+          last_param = params.split(",")[-1].strip()
+          var_name = re.split(r"\s+", last_param)[-1].replace("*", "").strip() or "flag"
+          
+          clone_repl_block = f"""
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          	bool is_current_ksu_domain = susfs_is_current_ksu_domain();
+          	bool is_current_zygote_domain = susfs_is_current_zygote_domain();
+          
+          	// KSU process handling
+          	if (unlikely(is_current_ksu_domain)) {{
+          		if (!({var_name} & CL_COPY_MNT_NS)) {{
+          			mnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          			goto bypass_orig_flow;
+          		}}
+          		mnt = alloc_vfsmnt(old->mnt_devname, true, old->mnt_id);
+          		if (mnt) {{
+          			mnt->mnt.susfs_mnt_id_backup = DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE;
+          		}}
+          		goto bypass_orig_flow;
+          	}}
+          
+          	// zygote handling for sus mounts
+          	if (likely(is_current_zygote_domain) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {{
+          		mnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          		goto bypass_orig_flow;
+          	}}
+          
+          	// other unshare handling
+          	if (({var_name} & CL_COPY_MNT_NS) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {{
+          		mnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          		goto bypass_orig_flow;
+          	}}
+          
+          	mnt = alloc_vfsmnt(old->mnt_devname, false, 0);
+          bypass_orig_flow:
+          #else
+          	mnt = alloc_vfsmnt(old->mnt_devname);
+          #endif
+          """
+          
+          idx = txt.find("static struct mount *clone_mnt")
+          seg = txt[idx:] if idx >= 0 else txt
+          needle2 = "mnt = alloc_vfsmnt(old->mnt_devname);"
+          pos = seg.find(needle2)
+          if pos < 0:
+              print("❌ Cannot find alloc_vfsmnt(old->mnt_devname) in clone_mnt.")
+              sys.exit(1)
+          
+          seg2 = seg.replace(needle2, clone_repl_block.strip("\n"), 1)
+          txt = txt[:idx] + seg2 if idx >= 0 else seg2
+          
+          p.write_text(txt, encoding="utf-8")
+          print("✅ Manual SusFS fixes applied to fs/namespace.c")
+          PY
+          sed -i 's/^          //' /tmp/susfs_fix_namespace.py
           python3 /tmp/susfs_fix_namespace.py
 
           rm -f fs/namespace.c.rej
