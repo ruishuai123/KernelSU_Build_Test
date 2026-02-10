@@ -238,14 +238,13 @@ jobs:
           export KBUILD_BUILD_HOST=Github-Action
           export KBUILD_BUILD_USER="$(echo "${{ github.actor }}" | tr A-Z a-z)"
 
-          # 用数组避免空格展开/引用问题
           BA_ARGS=(CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-)
           EX_ARGS=(LD=ld.lld LLVM=1 LLVM_IAS=1)
 
           # 1) 先生成基础 defconfig
           make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" vendor/kona-perf_defconfig
 
-          # 2) 合并 fragment（这些是 config 片段，不是 make target）
+          # 2) 合并 fragment（config 片段不是 make target）
           FRAGS=(
             arch/arm64/configs/vendor/debugfs.config
             arch/arm64/configs/vendor/oplus.config
@@ -316,7 +315,7 @@ jobs:
           path: kernel_workspace/AnyKernel3/*.zip
 
       # ----------------------------
-      # Telegram notify (NO secrets in if:)
+      # Telegram notify (NO heredoc, NO secrets in if:)
       # ----------------------------
       - name: Send Success to Telegram
         if: success()
@@ -338,20 +337,9 @@ jobs:
           NF_STATUS="❌";    [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ] && NF_STATUS="✅"
           BBR_STATUS="❌";   [ "${{ inputs.ENABLE_BBR }}" = "true" ] && BBR_STATUS="✅"
 
-          CAPTION=$(cat <<EOF
-✅ Kernel Build Success!
-
-Branch: ${{ inputs.LINEAGE_BRANCH }}
-Kernel Version: ${{ env.KERNEL_VERSION }}
-SukiSU Ref: ${{ env.SUKISU_REF }}
-SukiSU Ver: ${{ env.SUKISU_VER }} (${{ env.SUKISU_COMMIT }})
-
-SusFS: ${SUSFS_STATUS}
-LSM/BBG: ${LSM_STATUS}
-Netfilter: ${NF_STATUS}
-BBR+ECN: ${BBR_STATUS}
-EOF
-          )
+          CAPTION="$(printf "✅ Kernel Build Success!\n\nBranch: %s\nKernel Version: %s\nSukiSU Ref: %s\nSukiSU Ver: %s (%s)\n\nSusFS: %s\nLSM/BBG: %s\nNetfilter: %s\nBBR+ECN: %s\n" \
+            "${{ inputs.LINEAGE_BRANCH }}" "${{ env.KERNEL_VERSION }}" "${{ env.SUKISU_REF }}" "${{ env.SUKISU_VER }}" "${{ env.SUKISU_COMMIT }}" \
+            "${SUSFS_STATUS}" "${LSM_STATUS}" "${NF_STATUS}" "${BBR_STATUS}")"
 
           curl -sS -F chat_id="$TELEGRAM_CHAT_ID" \
             -F document=@"${{ env.ZIP_NAME }}" \
@@ -371,15 +359,8 @@ EOF
             exit 0
           fi
 
-          MESSAGE=$(cat <<EOF
-❌ Kernel Build Failed!
-
-Branch: ${{ inputs.LINEAGE_BRANCH }}
-Build User: ${{ github.actor }}
-
-Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-EOF
-          )
+          MESSAGE="$(printf "❌ Kernel Build Failed!\n\nBranch: %s\nBuild User: %s\n\nLogs: %s/%s/actions/runs/%s\n" \
+            "${{ inputs.LINEAGE_BRANCH }}" "${{ github.actor }}" "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")"
 
           curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
             -d chat_id="$TELEGRAM_CHAT_ID" \
