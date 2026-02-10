@@ -1,4 +1,4 @@
-name: Build LineageOS Kernel (SukiSU-Ultra + SusFS-Dev + KPM + Extensions)
+name: Build LineageOS Kernel (SukiSU-Ultra + SusFS-Dev + KPM)
 
 on:
   workflow_dispatch:
@@ -38,13 +38,6 @@ on:
         type: boolean
         default: true
 
-permissions:
-  contents: read
-
-concurrency:
-  group: lineageos-kernel-${{ github.workflow }}-${{ github.ref }}-${{ inputs.LINEAGE_BRANCH }}
-  cancel-in-progress: true
-
 env:
   TZ: Asia/Shanghai
   CLANG_VERSION: clang-r547379
@@ -55,10 +48,6 @@ env:
 
   KPM_PATCH_URL: https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/refs/heads/main/kpm/patch_linux
 
-  # ccache
-  CCACHE_DIR: ${{ github.workspace }}/.ccache
-  CCACHE_MAXSIZE: 6G
-
 jobs:
   build:
     name: Build Kernel (SukiSU-Ultra)
@@ -67,8 +56,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Set swap to 10G
         uses: pierotofy/set-swap-space@master
@@ -91,22 +78,6 @@ jobs:
             libelf-dev dwarves
 
           mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
-          mkdir -p "$CCACHE_DIR"
-
-          ccache -M "${CCACHE_MAXSIZE}" || true
-          ccache -s || true
-
-      # ----------------------------
-      # ccache
-      # ----------------------------
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ env.CLANG_VERSION }}-${{ inputs.LINEAGE_BRANCH }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ runner.os }}-${{ env.CLANG_VERSION }}-${{ inputs.LINEAGE_BRANCH }}-
-            ccache-${{ runner.os }}-${{ env.CLANG_VERSION }}-
 
       # ----------------------------
       # Toolchains
@@ -129,15 +100,15 @@ jobs:
             "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
           tar -C clang-aosp -zxvf "${CLANG_VERSION}.tar.gz"
 
-      - name: Cache GCC toolchain
-        id: cache-gcc
+      - name: Cache GCC toolchain (aarch64)
+        id: cache-gcc-64
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/kernel_workspace/gcc-64
           key: gcc-aarch64-${{ env.GCC_TAG }}
 
-      - name: Download & extract Gcc-aosp (if cache miss)
-        if: ${{ steps.cache-gcc.outputs.cache-hit != 'true' }}
+      - name: Download & extract Gcc-aosp (aarch64) (if cache miss)
+        if: ${{ steps.cache-gcc-64.outputs.cache-hit != 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -146,6 +117,25 @@ jobs:
           wget -O gcc-aarch64.tar.gz \
             "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz"
           tar -C gcc-64 -zxvf gcc-aarch64.tar.gz
+
+      # ✅ 关键：补齐 arm(32-bit) GCC 4.9（很多 4.19 树需要）
+      - name: Cache GCC toolchain (arm32)
+        id: cache-gcc-32
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/kernel_workspace/gcc-32
+          key: gcc-arm-${{ env.GCC_TAG }}
+
+      - name: Download & extract Gcc-aosp (arm32) (if cache miss)
+        if: ${{ steps.cache-gcc-32.outputs.cache-hit != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+          mkdir -p gcc-32
+          wget -O gcc-arm.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz"
+          tar -C gcc-32 -zxvf gcc-arm.tar.gz
 
       # ----------------------------
       # Kernel source
@@ -183,7 +173,6 @@ jobs:
           echo "SUKISU_VER=$SUKISU_VER" >> "$GITHUB_ENV"
           echo "SUKISU_COMMIT=$SUKISU_COMMIT" >> "$GITHUB_ENV"
 
-          # 你的仓库里需要有 patches/kernel-4.19_5.4-patch.sh
           bash "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" || true
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
@@ -235,9 +224,6 @@ jobs:
           echo "[INFO] Current .rej list (if any):"
           find . -maxdepth 6 -type f -name "*.rej" -print || true
 
-      # ----------------------------
-      # Apply your cmdline fix patch
-      # ----------------------------
       - name: Apply SusFS cmdline fix (OnePlus8 4.19)
         if: ${{ inputs.ENABLE_SUSFS == true }}
         shell: bash
@@ -257,9 +243,6 @@ jobs:
             echo "[WARN] .rej exists after cmdline fix (might be from SusFS main patch). Continue."
           fi
 
-      # ----------------------------
-      # Fixups: 幂等插入 + 清理这两处对应的 .rej，然后检查是否还有其他 .rej
-      # ----------------------------
       - name: Apply SusFS fixups (task_mmu + uname) and cleanup rejs
         if: ${{ inputs.ENABLE_SUSFS == true }}
         shell: bash
@@ -386,9 +369,6 @@ jobs:
             set_kcfg "CONFIG_TCP_ECN" "y" "$CONFIG_FILE"
           fi
 
-      # ----------------------------
-      # Final override fragment (merge last)
-      # ----------------------------
       - name: Write final config fragment (override)
         shell: bash
         run: |
@@ -429,18 +409,19 @@ jobs:
           export ARCH=arm64
           export SUBARCH=arm64
           export BRAND_SHOW_FLAG=oneplus
-          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH"
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-32/bin:$PATH"
           export KBUILD_BUILD_HOST=Github-Action
           export KBUILD_BUILD_USER="$(echo "${{ github.actor }}" | tr A-Z a-z)"
-          export CCACHE_DIR="${CCACHE_DIR}"
 
-          BA_ARGS=(CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-)
+          BA_ARGS=(
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-android-
+            CROSS_COMPILE_ARM32=arm-linux-androideabi-
+          )
           EX_ARGS=(LD=ld.lld LLVM=1 LLVM_IAS=1)
 
-          # 先生成基础 defconfig
-          make O=out CC="ccache clang" "${BA_ARGS[@]}" "${EX_ARGS[@]}" vendor/kona-perf_defconfig
+          make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" vendor/kona-perf_defconfig
 
-          # 叠加 fragment
           FRAGS=()
           for f in \
             arch/arm64/configs/vendor/debugfs.config \
@@ -454,10 +435,9 @@ jobs:
 
           if [ "${#FRAGS[@]}" -gt 0 ]; then
             bash scripts/kconfig/merge_config.sh -m -O out out/.config "${FRAGS[@]}"
-            make O=out CC="ccache clang" "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
+            make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
           fi
 
-          # KPM 选项（需要 KALLSYMS_ALL 才能开启）
           if [ "${{ inputs.ENABLE_KPM }}" = "true" ]; then
             if grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config; then
               if grep -q '^# CONFIG_KPM is not set' out/.config; then
@@ -466,18 +446,52 @@ jobs:
                 sed -i 's/^CONFIG_KPM=.*/CONFIG_KPM=y/' out/.config
               fi
             fi
-            make O=out CC="ccache clang" "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
+            make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
           fi
 
-          make -j"$(nproc --all)" O=out CC="ccache clang" "${BA_ARGS[@]}" "${EX_ARGS[@]}" 2>&1 | tee error.log
+          # 用 PIPESTATUS 保证 tee 后也能拿到 make 的真实退出码
+          make -j"$(nproc --all)" O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" 2>&1 | tee error.log
+          rc="${PIPESTATUS[0]}"
+          exit "$rc"
 
-          # sanity check
-          grep -q '^CONFIG_KSU=y' out/.config
-          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
-            grep -q '^CONFIG_KSU_SUSFS=y' out/.config
+      # ✅ 自动抽取关键错误（失败也会运行，直接在 Actions Log 里看到根因）
+      - name: Extract first errors (always)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel" || exit 0
+          if [ -f error.log ]; then
+            echo "===== TOP ERROR HITS (first 200 lines) ====="
+            grep -nE "fatal error:|error:|ld\.lld: error:|undefined reference|No such file|not found|Killed" error.log | head -n 200 || true
+            echo "===== LAST 200 LINES ====="
+            tail -n 200 error.log || true
+            echo "===== dmesg (OOM?) ====="
+            dmesg | tail -n 120 || true
           fi
 
-          ccache -s || true
+      - name: Check kernel output
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel/out"
+          [ -f arch/arm64/boot/Image ] || { echo "Kernel output file is empty"; exit 1; }
+          echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> "$GITHUB_ENV"
+
+      - name: Upload debug artifacts (always)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts
+          path: |
+            kernel_workspace/android-kernel/out/.config
+            kernel_workspace/android-kernel/error.log
+            kernel_workspace/android-kernel/**/*.rej
+            kernel_workspace/android-kernel/**/*.orig
+            kernel_workspace/android-kernel/out/arch/arm64/boot/Image
+            kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz
+            kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz-dtb
+          if-no-files-found: ignore
 
       # ----------------------------
       # KPM Inline Patcher
@@ -541,29 +555,6 @@ jobs:
               ;;
           esac
 
-      - name: Check kernel output
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel/out"
-          [ -f arch/arm64/boot/Image ] || { echo "Kernel output file is empty"; exit 1; }
-          echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> "$GITHUB_ENV"
-
-      - name: Upload debug artifacts (always)
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-artifacts
-          path: |
-            kernel_workspace/android-kernel/out/.config
-            kernel_workspace/android-kernel/error.log
-            kernel_workspace/android-kernel/**/*.rej
-            kernel_workspace/android-kernel/**/*.orig
-            kernel_workspace/android-kernel/out/arch/arm64/boot/Image
-            kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz
-            kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz-dtb
-          if-no-files-found: ignore
-
       # ----------------------------
       # Package (AnyKernel3)
       # ----------------------------
@@ -580,10 +571,7 @@ jobs:
           sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' AnyKernel3/anykernel.sh
 
           rm -rf AnyKernel3/.git* AnyKernel3/README.md
-
-          # 只复制 Image（你的 ak3 脚本通常用 Image）
           cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
-
           cd AnyKernel3
 
           SUS_TAG=""
@@ -651,3 +639,4 @@ jobs:
           curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
             -d chat_id="$TELEGRAM_CHAT_ID" \
             --data-urlencode text="$MESSAGE"
+      
