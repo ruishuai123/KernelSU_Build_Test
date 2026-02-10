@@ -16,7 +16,7 @@ on:
 
       # 可选：指定 SusFS Patch 目录/文件（来自 JackA1ltman/NonGKI_Kernel_Patches）
       SUSFS_PATCH_DIR:
-        description: "SusFS Patch 目录（可选，如 mix2s_aosp_a15_419）。留空则自动挑一个 *_419/susfs_fixed.patch"
+        description: "SusFS Patch 目录（可选，如 kona_cos15_a15）。留空则自动挑一个 *_419/susfs_fixed.patch"
         required: false
         default: ""
       SUSFS_PATCH_FILE:
@@ -53,11 +53,11 @@ env:
   CLANG_VERSION: clang-r547379
   GCC_TAG: android-12.1.0_r27
 
-  # SusFS patch repo（对标成功项目）
+  # SusFS patch repo（对标 oneplus8 成功 workflow：用 op_kernel 分支更合适）
   SUSFS_PATCH_REPO: JackA1ltman/NonGKI_Kernel_Patches
-  SUSFS_PATCH_BRANCH: mi_kernel
+  SUSFS_PATCH_BRANCH: op_kernel
 
-  # KPM patcher（对标成功项目做法：下载可执行 patch_linux）
+  # KPM patcher（下载可执行 patch_linux）
   KPM_PATCH_URL: https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/refs/heads/main/kpm/patch_linux
 
 jobs:
@@ -195,7 +195,6 @@ jobs:
           rm -rf NonGKI_Kernel_Patches
           git clone --depth=1 -b "${SUSFS_PATCH_BRANCH}" "https://github.com/${SUSFS_PATCH_REPO}.git" NonGKI_Kernel_Patches
 
-          # 优先用用户指定目录/文件
           DIR="${{ inputs.SUSFS_PATCH_DIR }}"
           FILE="${{ inputs.SUSFS_PATCH_FILE }}"
 
@@ -216,7 +215,7 @@ jobs:
               exit 1
             fi
           else
-            # 自动兜底：找 *_419/susfs_fixed.patch（你的内核是 4.19）
+            # 自动兜底：找 *_419/susfs_fixed.patch（你的内核通常是 4.19）
             PATCH_FILE="$(find NonGKI_Kernel_Patches -maxdepth 3 -type f -path "*_419/susfs_fixed.patch" | head -n 1 || true)"
             if [ -z "$PATCH_FILE" ]; then
               PATCH_FILE="$(find NonGKI_Kernel_Patches -maxdepth 3 -type f -path "*_419/susfs_155_fixed.patch" | head -n 1 || true)"
@@ -246,6 +245,36 @@ jobs:
           fi
 
           echo "[OK] SusFS patch applied."
+
+      # ----------------------------
+      # Apply local OnePlus8 4.19 fix patch (cmdline)
+      # ----------------------------
+      - name: Apply SusFS cmdline fix (OnePlus8 4.19)
+        if: ${{ inputs.ENABLE_SUSFS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+
+          FIX_PATCH="$GITHUB_WORKSPACE/patches/susfs_cmdline_oneplus8_419.patch"
+          if [ ! -f "$FIX_PATCH" ]; then
+            echo "[ERROR] Fix patch not found: $FIX_PATCH"
+            exit 1
+          fi
+
+          # --forward: 已应用则跳过；失败也会产生 .rej
+          patch -p1 --forward < "$FIX_PATCH" || true
+
+          if find . -type f -name "*.rej" | grep -q .; then
+            echo "[ERROR] Local cmdline fix patch rejected (.rej found). Showing first 200 lines:"
+            for r in $(find . -type f -name "*.rej"); do
+              echo "----- $r -----"
+              sed -n '1,200p' "$r" || true
+            done
+            exit 1
+          fi
+
+          echo "[OK] Local cmdline fix applied or already applied."
 
       # ----------------------------
       # Extensions (defconfig tweaks)
@@ -389,7 +418,7 @@ jobs:
           fi
 
       # ----------------------------
-      # KPM Inline Patcher (对标 NonGKI 的做法)
+      # KPM Inline Patcher
       # ----------------------------
       - name: KPM Inline Patcher
         if: ${{ success() && inputs.ENABLE_KPM }}
@@ -419,15 +448,12 @@ jobs:
 
           echo "[INFO] KPM mode: $MODE"
 
-          # 下载 patch 工具
           cd "$IMAGE_DIR"
           curl -fLsS -o patch "${KPM_PATCH_URL}"
           chmod +x patch
 
-          # 对齐 NonGKI 的预期：patch 执行后生成 oImage
           case "$MODE" in
             gz-dtb)
-              # 保存 dtb 列表路径（常见两种）
               DTB_DIR=""
               if ls "$IMAGE_DIR/dts/qcom/"*.dtb 1>/dev/null 2>&1; then
                 DTB_DIR="$IMAGE_DIR/dts/qcom"
