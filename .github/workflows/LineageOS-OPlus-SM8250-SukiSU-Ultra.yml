@@ -1,0 +1,382 @@
+name: Build LineageOS Kernel (SukiSU-Ultra + SusFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      LINEAGE_BRANCH:
+        description: "LineageOS 分支 (例如 lineage-23.2)"
+        required: true
+        default: "lineage-23.2"
+
+      ENABLE_SUSFS:
+        description: "启用 SusFS (使用 SukiSU-Ultra 官方 susfs-main 分支)"
+        required: true
+        type: boolean
+        default: true
+
+      ENABLE_NETFILTER:
+        description: "启用 NETFILTER (TTL/HL/TPROXY)"
+        required: true
+        type: boolean
+        default: true
+
+      ENABLE_BBR:
+        description: "启用 BBR + ECN (TCP优化)"
+        required: true
+        type: boolean
+        default: true
+
+      ENABLE_LSM:
+        description: "启用 LSM / BBG (基带保护)"
+        required: true
+        type: boolean
+        default: true
+
+env:
+  TZ: Asia/Shanghai
+  CLANG_VERSION: clang-r547379
+  GCC_TAG: android-12.1.0_r27
+
+jobs:
+  build:
+    name: Build Kernel (SukiSU-Ultra)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set swap to 10G
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
+      - name: Setup build kernel environment
+        run: |
+          set -euxo pipefail
+
+          echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> $GITHUB_ENV
+          echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> $GITHUB_ENV
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            git ccache automake flex lzop bison gperf build-essential zip curl \
+            zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools \
+            dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev wget
+
+          mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
+
+      # ----------------------------
+      # Toolchains
+      # ----------------------------
+      - name: Cache Clang toolchain
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/kernel_workspace/clang-aosp
+          key: ${{ env.CLANG_VERSION }}
+
+      - name: Download & extract Clang-aosp (if cache miss)
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+          mkdir -p clang-aosp
+
+          wget -O "${CLANG_VERSION}.tar.gz" \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
+          tar -C clang-aosp -zxvf "${CLANG_VERSION}.tar.gz"
+
+      - name: Cache GCC toolchain
+        id: cache-gcc
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/kernel_workspace/gcc-64
+          key: gcc-aarch64-${{ env.GCC_TAG }}
+
+      - name: Download & extract Gcc-aosp (if cache miss)
+        if: steps.cache-gcc.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+          mkdir -p gcc-64
+
+          wget -O gcc-aarch64.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz"
+          tar -C gcc-64 -zxvf gcc-aarch64.tar.gz
+
+      # ----------------------------
+      # Kernel source
+      # ----------------------------
+      - name: Download kernel source
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+
+          git clone --recursive \
+            https://github.com/LineageOS/android_kernel_oneplus_sm8250 \
+            -b "${{ inputs.LINEAGE_BRANCH }}" \
+            android-kernel --depth=1
+
+      # ----------------------------
+      # SukiSU-Ultra (official)
+      # ----------------------------
+      - name: Set up SukiSU-Ultra (official setup.sh)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+
+          # 选择官方分支：SusFS 尽可能新 -> susfs-main
+          # 不启用 SusFS -> nongki
+          SUKISU_REF="nongki"
+          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
+            SUKISU_REF="susfs-main"
+          fi
+          echo "SUKISU_REF=$SUKISU_REF" >> $GITHUB_ENV
+
+          curl -fLsS https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh | bash -s "$SUKISU_REF"
+
+          # 记录版本信息（用于打包/通知）
+          SUKISU_VER="$(cd KernelSU && (git describe --tags --always || true))"
+          SUKISU_COMMIT="$(cd KernelSU && git rev-parse --short HEAD)"
+          echo "SUKISU_VER=$SUKISU_VER" >> $GITHUB_ENV
+          echo "SUKISU_COMMIT=$SUKISU_COMMIT" >> $GITHUB_ENV
+
+          # 你原本的 patch 仍可保留（允许失败）
+          bash "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" || true
+
+          # 去掉 -dirty
+          sed -i 's/ -dirty//g' scripts/setlocalversion
+
+      # ----------------------------
+      # ✅ 注入内核优化扩展 (已移除 ZRAM)
+      # ----------------------------
+      - name: Inject Kernel Extensions
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
+
+          set_kcfg() {
+            local key="$1"
+            local val="$2"
+            local file="$3"
+            if grep -qE "^${key}=" "$file"; then
+              sed -i "s/^${key}=.*/${key}=${val}/" "$file"
+            else
+              echo "${key}=${val}" >> "$file"
+            fi
+          }
+
+          # 1) LSM / Baseband Guard
+          if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then
+            echo "🛡️ Setting up Baseband Guard (LSM)..."
+            curl -fLsS https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh | bash
+            set_kcfg "CONFIG_BBG" "y" "$CONFIG_FILE"
+            sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
+          fi
+
+          # 2) NETFILTER (TTL/HL/TPROXY)
+          if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then
+            echo "🌐 Enabling Netfilter enhancements..."
+            set_kcfg "CONFIG_NETFILTER_XT_TARGET_TTL" "y" "$CONFIG_FILE"
+            set_kcfg "CONFIG_NETFILTER_XT_TARGET_HL" "y" "$CONFIG_FILE"
+            set_kcfg "CONFIG_NETFILTER_XT_MATCH_HL" "y" "$CONFIG_FILE"
+            set_kcfg "CONFIG_NETFILTER_XT_MATCH_TPROXY" "y" "$CONFIG_FILE"
+          fi
+
+          # 3) BBR + ECN
+          if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then
+            echo "🚀 Enabling TCP BBR + ECN..."
+            set_kcfg "CONFIG_TCP_CONG_BBR" "y" "$CONFIG_FILE"
+            set_kcfg "CONFIG_DEFAULT_BBR" "y" "$CONFIG_FILE"
+            set_kcfg "CONFIG_IP_ECN" "y" "$CONFIG_FILE"
+            set_kcfg "CONFIG_TCP_ECN" "y" "$CONFIG_FILE"
+          fi
+
+      # ----------------------------
+      # SukiSU / SusFS 最终 config 覆盖片段（放最后 merge，压过 oplus.config）
+      # ----------------------------
+      - name: Write final config fragment (override)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+
+          FRAG="arch/arm64/configs/vendor/sukisu_override.config"
+          : > "$FRAG"
+
+          # 必须开 KSU
+          echo "CONFIG_KSU=y" >> "$FRAG"
+
+          # 非 GKI 通常不希望 kprobe 被强开（oplus.config 里可能会设 y）
+          # 用 fragment 最后合并压过去
+          echo "CONFIG_KPROBES=n" >> "$FRAG"
+
+          # SukiSU-Ultra 常用（避免 su 相关问题）
+          echo "CONFIG_KSU_MANUAL_SU=y" >> "$FRAG"
+
+          # 如果启用 SusFS：给出常用开关（如果 Kconfig 中存在就会生效）
+          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
+            echo "CONFIG_KSU_SUSFS=y" >> "$FRAG"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$FRAG"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$FRAG"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$FRAG"
+            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> "$FRAG"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$FRAG"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$FRAG"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$FRAG"
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$FRAG"
+            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$FRAG"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$FRAG"
+            echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> "$FRAG"
+          fi
+
+          echo "Wrote override fragment: $FRAG"
+          cat "$FRAG"
+
+      # ----------------------------
+      # Build
+      # ----------------------------
+      - name: Build kernel
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export BRAND_SHOW_FLAG=oneplus
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH"
+          export KBUILD_BUILD_HOST=Github-Action
+          export KBUILD_BUILD_USER="$(echo "${{ github.actor }}" | tr A-Z a-z)"
+
+          BA_CMD="CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-"
+          EX_CMD="LD=ld.lld LLVM=1 LLVM_IAS=1"
+
+          # 注意：把 override 放最后，保证覆盖生效
+          DEFCONFIG="vendor/kona-perf_defconfig vendor/debugfs.config vendor/oplus.config vendor/sukisu_override.config"
+
+          make O=out CC=clang $BA_CMD $EX_CMD $DEFCONFIG
+          make -j"$(nproc --all)" O=out CC=clang $BA_CMD $EX_CMD
+
+          # 构建后校验（避免刷机才发现没开）
+          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
+            grep -q '^CONFIG_KSU=y' out/.config
+            grep -q '^CONFIG_KSU_SUSFS=y' out/.config
+            echo "✅ Verified: CONFIG_KSU=y and CONFIG_KSU_SUSFS=y in out/.config"
+          else
+            grep -q '^CONFIG_KSU=y' out/.config
+            echo "✅ Verified: CONFIG_KSU=y in out/.config"
+          fi
+
+      - name: Check kernel output
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel/out"
+
+          if [ -f arch/arm64/boot/Image ]; then
+            echo "CHECK_IMAGE=true" >> $GITHUB_ENV
+            echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> $GITHUB_ENV
+          else
+            echo "Kernel output file is empty"
+            exit 1
+          fi
+
+      # ----------------------------
+      # Package (AnyKernel3)
+      # ----------------------------
+      - name: Prepare AnyKernel3 and package
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3
+
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+          sed -i 's!BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!BLOCK=auto;!g' AnyKernel3/anykernel.sh
+          sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' AnyKernel3/anykernel.sh
+
+          rm -rf AnyKernel3/.git* AnyKernel3/README.md
+
+          cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
+          cd AnyKernel3
+
+          SUS_TAG=""
+          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
+            SUS_TAG="-SusFS"
+          fi
+
+          ZIP="AK3-${{ inputs.LINEAGE_BRANCH }}-OPlus-SM8250-SukiSU${SUS_TAG}_${{ env.SUKISU_VER }}_${{ env.SUKISU_COMMIT }}.zip"
+          zip -r "$ZIP" ./*
+          echo "ZIP_NAME=$ZIP" >> $GITHUB_ENV
+
+      - name: Upload AnyKernel3 ZIP (GitHub Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: AK3-SukiSU
+          path: kernel_workspace/AnyKernel3/*.zip
+
+      # ----------------------------
+      # ✅ Telegram 通知（不再使用 %0A，直接真实换行）
+      # ----------------------------
+      - name: Send Success to Telegram
+        if: success()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/AnyKernel3"
+
+          SUSFS_STATUS="❌"
+          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then SUSFS_STATUS="✅"; fi
+
+          LSM_STATUS="❌"
+          if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then LSM_STATUS="✅"; fi
+
+          NF_STATUS="❌"
+          if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then NF_STATUS="✅"; fi
+
+          BBR_STATUS="❌"
+          if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then BBR_STATUS="✅"; fi
+
+          CAPTION=$(cat <<EOF
+✅ Kernel Build Success!
+
+Branch: ${{ inputs.LINEAGE_BRANCH }}
+Kernel Version: ${{ env.KERNEL_VERSION }}
+SukiSU Ref: ${{ env.SUKISU_REF }}
+SukiSU Ver: ${{ env.SUKISU_VER }} (${{ env.SUKISU_COMMIT }})
+
+SusFS: ${SUSFS_STATUS}
+LSM/BBG: ${LSM_STATUS}
+Netfilter: ${NF_STATUS}
+BBR+ECN: ${BBR_STATUS}
+EOF
+          )
+
+          curl -sS -F chat_id="$TELEGRAM_CHAT_ID" \
+            -F document=@"${{ env.ZIP_NAME }}" \
+            -F parse_mode=Markdown \
+            --form-string caption="$CAPTION" \
+            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument"
+
+      - name: Send Failure to Telegram
+        if: failure()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euxo pipefail
+          MESSAGE=$(cat <<EOF
+❌ Kernel Build Failed!
+
+Branch: ${{ inputs.LINEAGE_BRANCH }}
+Build User: ${{ github.actor }}
+
+Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+EOF
+          )
+
+          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            -d chat_id="$TELEGRAM_CHAT_ID" \
+            --data-urlencode text="$MESSAGE"
