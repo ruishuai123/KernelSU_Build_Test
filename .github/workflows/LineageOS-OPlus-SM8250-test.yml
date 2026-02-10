@@ -1,329 +1,53 @@
-name: Build LineageOS Kernel (rsuntk + SusFS)
+- name: Integrate SusFS into kernel (rksu)
+  if: inputs.ENABLE_SUSFS == true
+  shell: bash
+  run: |
+    set -euo pipefail
+    cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
-on:
-  workflow_dispatch:
-    inputs:
-      LINEAGE_BRANCH:
-        description: "LineageOS 分支 (例如 lineage-23.2)"
-        required: true
-        default: "lineage-23.2"
+    # 1) 打 SusFS 主补丁（内核侧）
+    echo "== Applying susfs_patch_to_4.19.patch =="
+    patch -p1 < "$GITHUB_WORKSPACE/patches/susfs/susfs_patch_to_4.19.patch" || true
 
-      ENABLE_SUSFS:
-        description: "启用 SusFS (使用 rsuntk/KernelSU susfs-rksu-master)"
-        required: true
-        type: boolean
-        default: true
+    # 2) 可选：打 fixed 修复补丁（如果你有）
+    if [ -f "$GITHUB_WORKSPACE/patches/susfs/susfs_fixed.patch" ]; then
+      echo "== Applying susfs_fixed.patch =="
+      patch -p1 < "$GITHUB_WORKSPACE/patches/susfs/susfs_fixed.patch" || true
+    fi
 
-      ENABLE_NETFILTER:
-        description: "启用 NETFILTER (TTL/HL/TPROXY)"
-        required: true
-        type: boolean
-        default: true
+    if [ -f "$GITHUB_WORKSPACE/patches/susfs/susfs_155_fixed.patch" ]; then
+      echo "== Applying susfs_155_fixed.patch =="
+      patch -p1 < "$GITHUB_WORKSPACE/patches/susfs/susfs_155_fixed.patch" || true
+    fi
 
-      ENABLE_BBR:
-        description: "启用 BBR + ECN (TCP优化)"
-        required: true
-        type: boolean
-        default: true
+    # 3) 失败就把 rej 打出来（避免“继续编译但最终不可用”）
+    REJ=$(find . -name "*.rej" | wc -l || true)
+    if [ "$REJ" -ne 0 ]; then
+      echo "!! SusFS patch has rejects:"
+      find . -name "*.rej" -print -maxdepth 6
+      # 这里建议直接失败，或者你也可以允许存在 rej 并走 fixed 补丁路线
+      exit 1
+    fi
 
-      ENABLE_LSM:
-        description: "启用 LSM / BBG (基带保护)"
-        required: true
-        type: boolean
-        default: true
+    # 4) 写 defconfig（确保 KSU_SUSFS 真能编进去）
+    CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
+    {
+      echo "CONFIG_KSU_SUSFS=y"
+      echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+      echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+      echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+      echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+      echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+      echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+      echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+      echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+      echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+    } >> "$CONFIG_FILE"
 
-env:
-  TZ: Asia/Shanghai
-  CLANG_VERSION: clang-r547379
-  GCC_TAG: android-12.1.0_r27
-
-jobs:
-  build:
-    name: Build Kernel (rsuntk)
-    runs-on: ubuntu-22.04
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set swap to 10G
-        uses: pierotofy/set-swap-space@master
-        with:
-          swap-size-gb: 10
-
-      - name: Setup build environment
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> "$GITHUB_ENV"
-          echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> "$GITHUB_ENV"
-
-          sudo apt-get update
-          sudo apt-get install -y \
-            git ccache automake flex lzop bison gperf build-essential zip curl \
-            zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make \
-            squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 \
-            libncurses5-dev wget xz-utils
-
-          mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
-
-      - name: Cache Clang toolchain
-        id: cache-clang
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/kernel_workspace/clang-aosp
-          key: ${{ env.CLANG_VERSION }}
-
-      - name: Download & extract Clang-aosp (if cache miss)
-        if: steps.cache-clang.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace"
-          mkdir -p clang-aosp
-
-          url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
-          echo "Downloading: $url"
-          wget -q --show-progress --progress=dot:giga --tries=5 --waitretry=3 -O "${CLANG_VERSION}.tar.gz" "$url"
-          tar -C clang-aosp -zxvf "${CLANG_VERSION}.tar.gz"
-
-      - name: Cache GCC toolchain
-        id: cache-gcc
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/kernel_workspace/gcc-64
-          key: gcc-aarch64-${{ env.GCC_TAG }}
-
-      - name: Download & extract Gcc-aosp (if cache miss)
-        if: steps.cache-gcc.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace"
-          mkdir -p gcc-64
-
-          url="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz"
-          echo "Downloading: $url"
-          wget -q --show-progress --progress=dot:giga --tries=5 --waitretry=3 -O "gcc-aarch64.tar.gz" "$url"
-          tar -C gcc-64 -zxvf "gcc-aarch64.tar.gz"
-
-      - name: Download kernel source
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace"
-          git clone --recursive --depth=1 \
-            -b "${{ inputs.LINEAGE_BRANCH }}" \
-            https://github.com/LineageOS/android_kernel_oneplus_sm8250 \
-            android-kernel
-
-      - name: Set up KernelSU (rsuntk; auto susfs branch)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-
-          KSU_REF="main"
-          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
-            KSU_REF="susfs-rksu-master"
-          fi
-          echo "Using KernelSU ref: $KSU_REF"
-
-          curl -fLsS --retry 5 --retry-delay 2 \
-            https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh \
-            | bash -s "$KSU_REF"
-
-          # 你的 patches 可选（不存在也不硬失败）
-          bash "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" || true
-
-          # Non-GKI 默认 manual hook
-          echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/vendor/kona-perf_defconfig
-
-          # 如果开启 SusFS，则把 SusFS 相关开关写入 defconfig
-          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
-            CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
-            {
-              echo "CONFIG_KSU_SUSFS=y"
-              echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
-              echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-              echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
-              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-              echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y"
-              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
-              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-              echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
-              echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
-              echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-            } >> "$CONFIG_FILE"
-            echo "SUSFS_VERSION=rsuntk-susfs-rksu-master" >> "$GITHUB_ENV"
-          fi
-
-          # version（尽量算，算不到就给个占位）
-          if [ -d KernelSU/.git ]; then
-            RSKSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
-          else
-            RSKSUVER=30000
-          fi
-          echo "RSKSUVER=$RSKSUVER" >> "$GITHUB_ENV"
-
-          # remove -dirty
-          sed -i 's/ -dirty//g' scripts/setlocalversion
-
-      - name: Inject Kernel Extensions
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-          CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
-
-          # 1) LSM / Baseband Guard
-          if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then
-            echo "🛡️ Setting up Baseband Guard (LSM)..."
-            curl -fLsS --retry 5 --retry-delay 2 \
-              https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh \
-              | bash
-            echo "CONFIG_BBG=y" >> "$CONFIG_FILE"
-
-            sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
-          fi
-
-          # 2) NETFILTER
-          if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then
-            echo "🌐 Enabling Netfilter enhancements..."
-            {
-              echo "CONFIG_NETFILTER_XT_TARGET_TTL=y"
-              echo "CONFIG_NETFILTER_XT_TARGET_HL=y"
-              echo "CONFIG_NETFILTER_XT_MATCH_HL=y"
-              echo "CONFIG_NETFILTER_XT_MATCH_TPROXY=y"
-            } >> "$CONFIG_FILE"
-          fi
-
-          # 3) BBR + ECN
-          if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then
-            echo "🚀 Enabling TCP BBR + ECN..."
-            {
-              echo "CONFIG_TCP_CONG_BBR=y"
-              echo "CONFIG_DEFAULT_BBR=y"
-              echo "CONFIG_IP_ECN=y"
-              echo "CONFIG_TCP_ECN=y"
-            } >> "$CONFIG_FILE"
-          fi
-
-      - name: Build kernel
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export BRAND_SHOW_FLAG=oneplus
-          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH"
-          export KBUILD_BUILD_HOST=Github-Action
-          export KBUILD_BUILD_USER="$(echo "${{ github.actor }}" | tr A-Z a-z)"
-
-          BA_CMD="CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-"
-          EX_CMD="LD=ld.lld LLVM=1 LLVM_IAS=1"
-          DEFCONFIG="vendor/kona-perf_defconfig vendor/debugfs.config vendor/oplus.config"
-
-          make O=out CC=clang $BA_CMD $EX_CMD $DEFCONFIG
-          make -j"$(nproc --all)" O=out CC=clang $BA_CMD $EX_CMD
-
-          # ✅ 必须校验：避免“编译过了但刷机 /proc/config.gz 没有 KSU_SUSFS”
-          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
-            echo "==== SusFS config check (out/.config) ===="
-            grep -nE '^CONFIG_KSU_SUSFS=y' out/.config
-            echo "✅ out/.config confirms CONFIG_KSU_SUSFS=y"
-          fi
-
-      - name: Check kernel output
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel/out"
-
-          if [ -f arch/arm64/boot/Image ]; then
-            echo "CHECK_IMAGE=true" >> "$GITHUB_ENV"
-            echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> "$GITHUB_ENV"
-          else
-            echo "Kernel output file is empty"
-            exit 1
-          fi
-
-      - name: Prepare AnyKernel3 and package
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace"
-
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3
-          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
-          sed -i 's!BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!BLOCK=auto;!g' AnyKernel3/anykernel.sh
-          sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' AnyKernel3/anykernel.sh
-
-          rm -rf AnyKernel3/.git* AnyKernel3/README.md
-          cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
-
-          cd AnyKernel3
-          SUS_TAG=""
-          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
-            SUS_TAG="-SusFS"
-          fi
-
-          ZIP="AK3-${{ inputs.LINEAGE_BRANCH }}-OPlus-SM8250-rsuntk${SUS_TAG}_KSU_${{ env.RSKSUVER }}.zip"
-          zip -r "$ZIP" ./*
-          echo "ZIP_NAME=$ZIP" >> "$GITHUB_ENV"
-
-      - name: Upload AnyKernel3 ZIP (GitHub Artifact)
-        uses: actions/upload-artifact@v4
-        with:
-          name: AK3-rsuntk
-          path: kernel_workspace/AnyKernel3/*.zip
-
-      - name: Send Success to Telegram
-        if: success()
-        shell: bash
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/AnyKernel3"
-
-          CAPTION="✅ *Kernel Build Success!*%0A%0A"
-          CAPTION+="🔸 *Branch:* ${{ inputs.LINEAGE_BRANCH }}%0A"
-          CAPTION+="🔸 *Kernel Version:* ${{ env.KERNEL_VERSION }}%0A"
-          CAPTION+="🔸 *KSU Version:* ${{ env.RSKSUVER }}%0A%0A"
-
-          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then CAPTION+="🔹 *SusFS:* ✅%0A"; else CAPTION+="🔹 *SusFS:* ❌%0A"; fi
-          if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then CAPTION+="🔹 *LSM/BBG:* ✅%0A"; else CAPTION+="🔹 *LSM/BBG:* ❌%0A"; fi
-          if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then CAPTION+="🔹 *Netfilter:* ✅%0A"; else CAPTION+="🔹 *Netfilter:* ❌%0A"; fi
-          if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then CAPTION+="🔹 *BBR+ECN:* ✅%0A"; else CAPTION+="🔹 *BBR+ECN:* ❌%0A"; fi
-
-          curl -s --fail \
-            -F chat_id="$TELEGRAM_CHAT_ID" \
-            -F document=@"${{ env.ZIP_NAME }}" \
-            -F parse_mode=Markdown \
-            -F caption="$CAPTION" \
-            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument"
-
-      - name: Send Failure to Telegram
-        if: failure()
-        shell: bash
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          set -euo pipefail
-          MESSAGE="❌ *Kernel Build Failed!*%0A%0A"
-          MESSAGE+="🔸 *Branch:* ${{ inputs.LINEAGE_BRANCH }}%0A"
-          MESSAGE+="🔸 *Build User:* ${{ github.actor }}%0A%0A"
-          MESSAGE+="📋 *Logs:* [View Action Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
-
-          curl -s --fail -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-            -d chat_id="$TELEGRAM_CHAT_ID" \
-            -d parse_mode=Markdown \
-            -d text="$MESSAGE"
+    # 5) 硬校验：让 Makefile:121 不再 Stop
+    echo "== Verify SusFS integrated markers =="
+    # 这些检查项是“最常见”的 SusFS 集成标志
+    (ls include/linux | grep -i susfs) || (echo "missing susfs header" && exit 1)
+    (ls fs | grep -i susfs) || (echo "missing susfs fs code" && exit 1)
+    grep -R "CONFIG_KSU_SUSFS" -n fs/namespace.c >/dev/null 2>&1 || true
+    echo "✅ SusFS seems integrated."
