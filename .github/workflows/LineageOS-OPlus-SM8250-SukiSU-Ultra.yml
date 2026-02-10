@@ -1,4 +1,4 @@
-name: Build LineageOS Kernel (SukiSU-Ultra + SusFS-Dev + KPM)
+name: Build LineageOS Kernel (SukiSU-Ultra + SusFS-Dev + KPM + Extensions)
 
 on:
   workflow_dispatch:
@@ -38,6 +38,13 @@ on:
         type: boolean
         default: true
 
+permissions:
+  contents: read
+
+concurrency:
+  group: lineageos-kernel-${{ github.workflow }}-${{ github.ref }}-${{ inputs.LINEAGE_BRANCH }}
+  cancel-in-progress: true
+
 env:
   TZ: Asia/Shanghai
   CLANG_VERSION: clang-r547379
@@ -48,6 +55,10 @@ env:
 
   KPM_PATCH_URL: https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/refs/heads/main/kpm/patch_linux
 
+  # ccache
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 6G
+
 jobs:
   build:
     name: Build Kernel (SukiSU-Ultra)
@@ -56,6 +67,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Set swap to 10G
         uses: pierotofy/set-swap-space@master
@@ -78,6 +91,22 @@ jobs:
             libelf-dev dwarves
 
           mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
+          mkdir -p "$CCACHE_DIR"
+
+          ccache -M "${CCACHE_MAXSIZE}" || true
+          ccache -s || true
+
+      # ----------------------------
+      # ccache
+      # ----------------------------
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ env.CLANG_VERSION }}-${{ inputs.LINEAGE_BRANCH }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ env.CLANG_VERSION }}-${{ inputs.LINEAGE_BRANCH }}-
+            ccache-${{ runner.os }}-${{ env.CLANG_VERSION }}-
 
       # ----------------------------
       # Toolchains
@@ -154,6 +183,7 @@ jobs:
           echo "SUKISU_VER=$SUKISU_VER" >> "$GITHUB_ENV"
           echo "SUKISU_COMMIT=$SUKISU_COMMIT" >> "$GITHUB_ENV"
 
+          # 你的仓库里需要有 patches/kernel-4.19_5.4-patch.sh
           bash "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" || true
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
@@ -402,12 +432,15 @@ jobs:
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH"
           export KBUILD_BUILD_HOST=Github-Action
           export KBUILD_BUILD_USER="$(echo "${{ github.actor }}" | tr A-Z a-z)"
+          export CCACHE_DIR="${CCACHE_DIR}"
 
           BA_ARGS=(CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-)
           EX_ARGS=(LD=ld.lld LLVM=1 LLVM_IAS=1)
 
-          make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" vendor/kona-perf_defconfig
+          # 先生成基础 defconfig
+          make O=out CC="ccache clang" "${BA_ARGS[@]}" "${EX_ARGS[@]}" vendor/kona-perf_defconfig
 
+          # 叠加 fragment
           FRAGS=()
           for f in \
             arch/arm64/configs/vendor/debugfs.config \
@@ -421,9 +454,10 @@ jobs:
 
           if [ "${#FRAGS[@]}" -gt 0 ]; then
             bash scripts/kconfig/merge_config.sh -m -O out out/.config "${FRAGS[@]}"
-            make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
+            make O=out CC="ccache clang" "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
           fi
 
+          # KPM 选项（需要 KALLSYMS_ALL 才能开启）
           if [ "${{ inputs.ENABLE_KPM }}" = "true" ]; then
             if grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config; then
               if grep -q '^# CONFIG_KPM is not set' out/.config; then
@@ -432,15 +466,18 @@ jobs:
                 sed -i 's/^CONFIG_KPM=.*/CONFIG_KPM=y/' out/.config
               fi
             fi
-            make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
+            make O=out CC="ccache clang" "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
           fi
 
-          make -j"$(nproc --all)" O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" 2>&1 | tee error.log
+          make -j"$(nproc --all)" O=out CC="ccache clang" "${BA_ARGS[@]}" "${EX_ARGS[@]}" 2>&1 | tee error.log
 
+          # sanity check
           grep -q '^CONFIG_KSU=y' out/.config
           if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
             grep -q '^CONFIG_KSU_SUSFS=y' out/.config
           fi
+
+          ccache -s || true
 
       # ----------------------------
       # KPM Inline Patcher
@@ -543,7 +580,10 @@ jobs:
           sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' AnyKernel3/anykernel.sh
 
           rm -rf AnyKernel3/.git* AnyKernel3/README.md
+
+          # 只复制 Image（你的 ak3 脚本通常用 Image）
           cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
+
           cd AnyKernel3
 
           SUS_TAG=""
