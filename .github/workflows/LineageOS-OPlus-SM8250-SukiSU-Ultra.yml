@@ -1,610 +1,216 @@
-name: Build LineageOS Kernel (SukiSU-Ultra + SusFS-Dev + KPM)
+name: LineageOS OPlus SM8250 - SukiSU-Ultra (SusFS + KPM)
 
 on:
   workflow_dispatch:
-    inputs:
-      LINEAGE_BRANCH:
-        description: "LineageOS 分支 (例如 lineage-23.2)"
-        required: true
-        default: "lineage-23.2"
-
-      ENABLE_SUSFS:
-        description: "启用 SusFS（SukiSU-Ultra: susfs-dev）"
-        required: true
-        type: boolean
-        default: true
-
-      ENABLE_KPM:
-        description: "启用 KPM Inline（会尝试注入到 Image/Image.gz/Image.gz-dtb）"
-        required: true
-        type: boolean
-        default: true
-
-      ENABLE_NETFILTER:
-        description: "启用 NETFILTER (TTL/HL/TPROXY)"
-        required: true
-        type: boolean
-        default: true
-
-      ENABLE_BBR:
-        description: "启用 BBR + ECN (TCP优化)"
-        required: true
-        type: boolean
-        default: true
-
-      ENABLE_LSM:
-        description: "启用 LSM / BBG (基带保护)"
-        required: true
-        type: boolean
-        default: true
-
-env:
-  TZ: Asia/Shanghai
-  CLANG_VERSION: clang-r547379
-  GCC_TAG: android-12.1.0_r27
-
-  SUSFS_PATCH_REPO: JackA1ltman/NonGKI_Kernel_Patches
-  SUSFS_PATCH_BRANCH: op_kernel
-
-  KPM_PATCH_URL: https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/refs/heads/main/kpm/patch_linux
 
 jobs:
   build:
-    name: Build Kernel (SukiSU-Ultra)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+
+    env:
+      # ===== 你只需要改这里 3 个 =====
+      KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8250.git
+      KERNEL_BRANCH: android12
+      DEFCONFIG: vendor/kona_defconfig
+      # =============================
+
+      # SukiSU-Ultra
+      SUKISU_REPO: https://github.com/SukiSU-Ultra/SukiSU-Ultra.git
+      SUKISU_BRANCH: main
+
+      # Build
+      ARCH: arm64
+      SUBARCH: arm64
+      CCACHE_COMPRESS: "1"
+      CCACHE_MAXSIZE: 4G
 
     steps:
-      - name: Checkout
+      - name: Checkout this repo (patches + workflow)
         uses: actions/checkout@v4
-
-      - name: Set swap to 10G
-        uses: pierotofy/set-swap-space@master
         with:
-          swap-size-gb: 10
+          fetch-depth: 0
 
-      - name: Setup build kernel environment
-        shell: bash
+      - name: Install dependencies
         run: |
           set -euo pipefail
-          echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> "$GITHUB_ENV"
-          echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> "$GITHUB_ENV"
-
           sudo apt-get update
           sudo apt-get install -y \
-            git ccache automake flex lzop bison gperf build-essential zip curl \
-            zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools \
-            dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev wget \
-            libelf-dev dwarves
+            bc bison build-essential ccache curl flex g++ gcc git gnupg gperf \
+            imagemagick libncurses5-dev libssl-dev libtinfo5 libxml2-utils lz4 \
+            make ninja-build openjdk-11-jdk python3 python3-pip rsync unzip \
+            wget zip zstd
 
-          mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
-
-      # ----------------------------
-      # Toolchains
-      # ----------------------------
-      - name: Cache Clang toolchain
-        id: cache-clang
-        uses: actions/cache@v4
+      - name: Prepare ccache
+        uses: hendrikmuhs/ccache-action@v1.2
         with:
-          path: ${{ github.workspace }}/kernel_workspace/clang-aosp
-          key: ${{ env.CLANG_VERSION }}
+          max-size: 4G
 
-      - name: Download & extract Clang-aosp (if cache miss)
-        if: steps.cache-clang.outputs.cache-hit != 'true'
-        shell: bash
+      - name: Clone kernel source
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace"
-          mkdir -p clang-aosp
-          wget -O "${CLANG_VERSION}.tar.gz" \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
-          tar -C clang-aosp -zxvf "${CLANG_VERSION}.tar.gz"
+          rm -rf kernel_workspace
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+          git clone --depth=1 -b "${KERNEL_BRANCH}" "${KERNEL_REPO}" android-kernel
+          cd android-kernel
+          echo "Kernel top: $(pwd)"
+          uname -a
 
-      - name: Cache GCC toolchain
-        id: cache-gcc
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/kernel_workspace/gcc-64
-          key: gcc-aarch64-${{ env.GCC_TAG }}
-
-      - name: Download & extract Gcc-aosp (if cache miss)
-        if: steps.cache-gcc.outputs.cache-hit != 'true'
-        shell: bash
+      - name: Clone SukiSU-Ultra
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace"
-          mkdir -p gcc-64
-          wget -O gcc-aarch64.tar.gz \
-            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz"
-          tar -C gcc-64 -zxvf gcc-aarch64.tar.gz
+          cd kernel_workspace
+          rm -rf sukisu
+          git clone --depth=1 -b "${SUKISU_BRANCH}" "${SUKISU_REPO}" sukisu
+          echo "SukiSU-Ultra cloned."
 
-      # ----------------------------
-      # Kernel source
-      # ----------------------------
-      - name: Download kernel source
-        shell: bash
+      # === 集成 SukiSU-Ultra（按常见方式：把 drivers/kernelsu 放进内核树）
+      - name: Integrate SukiSU-Ultra into kernel tree
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace"
-          git clone --recursive \
-            https://github.com/LineageOS/android_kernel_oneplus_sm8250 \
-            -b "${{ inputs.LINEAGE_BRANCH }}" \
-            android-kernel --depth=1
+          KDIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          SDIR="$GITHUB_WORKSPACE/kernel_workspace/sukisu"
 
-      # ----------------------------
-      # SukiSU-Ultra (official setup.sh) -> susfs-dev
-      # ----------------------------
-      - name: Set up SukiSU-Ultra (susfs-dev, official setup.sh)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          # 这里假设 SukiSU-Ultra 的 KernelSU 源在仓库内的 drivers/kernelsu
+          # 如果它目录结构不同，你只需要改下面这两行 cp 的来源路径即可
+          rm -rf "$KDIR/drivers/kernelsu"
+          mkdir -p "$KDIR/drivers"
+          cp -a "$SDIR/drivers/kernelsu" "$KDIR/drivers/"
 
-          SUKISU_REF="nongki"
-          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
-            SUKISU_REF="susfs-dev"
+          # Kconfig / Makefile 挂载（若已存在则不重复）
+          if ! grep -q 'drivers/kernelsu/Kconfig' "$KDIR/drivers/Kconfig"; then
+            echo 'source "drivers/kernelsu/Kconfig"' >> "$KDIR/drivers/Kconfig"
           fi
-          echo "SUKISU_REF=$SUKISU_REF" >> "$GITHUB_ENV"
-
-          curl -fLsS https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh \
-            | bash -s "$SUKISU_REF"
-
-          SUKISU_VER="$(cd KernelSU && (git describe --tags --always || true))"
-          SUKISU_COMMIT="$(cd KernelSU && git rev-parse --short HEAD)"
-          echo "SUKISU_VER=$SUKISU_VER" >> "$GITHUB_ENV"
-          echo "SUKISU_COMMIT=$SUKISU_COMMIT" >> "$GITHUB_ENV"
-
-          bash "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" || true
-          sed -i 's/ -dirty//g' scripts/setlocalversion
-
-      # ----------------------------
-      # SusFS kernel patch (允许先产生 .rej，后面修复再放行)
-      # ----------------------------
-      - name: Patch SusFS (kernel source patch, allow rejs)
-        if: ${{ inputs.ENABLE_SUSFS }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-
-          echo "Detected kernel version: $(awk -F' = ' '/^VERSION =/{v=$2} /^PATCHLEVEL =/{p=$2} END{print v"."p}' Makefile)"
-
-          rm -rf NonGKI_Kernel_Patches
-          git clone --depth=1 -b "${SUSFS_PATCH_BRANCH}" "https://github.com/${SUSFS_PATCH_REPO}.git" NonGKI_Kernel_Patches
-
-          FILE="susfs_fixed.patch"
-          PATCH_FILE=""
-
-          for cand in \
-            "NonGKI_Kernel_Patches/kona_cos15_a15/${FILE}" \
-            "NonGKI_Kernel_Patches/kona_oos/${FILE}" \
-            "NonGKI_Kernel_Patches/kona_cos15_a15/susfs_fixed.patch" \
-            "NonGKI_Kernel_Patches/kona_oos/susfs_fixed.patch" \
-            "NonGKI_Kernel_Patches/kona_cos15_a15/susfs_155_fixed.patch" \
-            "NonGKI_Kernel_Patches/kona_oos/susfs_155_fixed.patch"
-          do
-            if [ -f "$cand" ]; then
-              PATCH_FILE="$cand"
-              break
-            fi
-          done
-
-          if [ -z "$PATCH_FILE" ]; then
-            PATCH_FILE="$(find NonGKI_Kernel_Patches -maxdepth 4 -type f -name 'susfs_fixed.patch' | head -n 1 || true)"
+          if ! grep -q 'kernelsu/' "$KDIR/drivers/Makefile"; then
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> "$KDIR/drivers/Makefile"
           fi
 
-          if [ -z "$PATCH_FILE" ]; then
-            echo "[ERROR] Cannot find any susfs_fixed.patch in ${SUSFS_PATCH_REPO}@${SUSFS_PATCH_BRANCH}"
-            find NonGKI_Kernel_Patches -maxdepth 4 -type f -name 'susfs*_fixed*.patch' | head -n 50 || true
+          echo "Integrated SukiSU-Ultra into kernel."
+
+      # === 应用你仓库内的 SusFS 补丁（你已经新增好了那两个 patch 文件）
+      - name: Apply SusFS patches (OnePlus 8 / 4.19)
+        run: |
+          set -euo pipefail
+          KDIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          cd "$KDIR"
+
+          echo "Applying: patches/susfs_cmdline_oneplus8_419.patch"
+          git apply --verbose "$GITHUB_WORKSPACE/patches/susfs_cmdline_oneplus8_419.patch"
+
+          echo "Applying: patches/susfs_fixups_oneplus8_419.patch"
+          git apply --verbose "$GITHUB_WORKSPACE/patches/susfs_fixups_oneplus8_419.patch"
+
+          echo "SusFS patches applied."
+
+      # === 关键：修复 KPM 在 4.19 上的 access_ok 参数不匹配（2参 -> 3参）
+      - name: Fix KPM access_ok for arm64 4.19 (patch inline)
+        run: |
+          set -euo pipefail
+          KDIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          cd "$KDIR"
+
+          KPM_FILE="drivers/kernelsu/kpm/kpm.c"
+          if [ ! -f "$KPM_FILE" ]; then
+            echo "ERROR: $KPM_FILE not found. SukiSU-Ultra integrate step may be wrong."
             exit 1
           fi
 
-          echo "[INFO] Using SusFS patch: $PATCH_FILE"
-          patch -p1 < "$PATCH_FILE" || true
+          cat > /tmp/kpm_access_ok_419.patch <<'PATCH'
+diff --git a/drivers/kernelsu/kpm/kpm.c b/drivers/kernelsu/kpm/kpm.c
+index 0000000..1111111 100644
+--- a/drivers/kernelsu/kpm/kpm.c
++++ b/drivers/kernelsu/kpm/kpm.c
+@@ -1,3 +1,4 @@
++/* NOTE: patched for kernel 4.19 arm64 access_ok(type, addr, size) */
+@@
+-        if (!access_ok(arg1, 255)) {
++        if (!access_ok(0, arg1, 255)) {
+@@
+-            if (!access_ok(arg2, 255)) {
++            if (!access_ok(0, arg2, 255)) {
+@@
+-        if (!access_ok(arg1, sizeof(kernel_name_buffer))) {
++        if (!access_ok(0, arg1, sizeof(kernel_name_buffer))) {
+@@
+-        if (!access_ok(arg1, sizeof(kernel_name_buffer))) {
++        if (!access_ok(0, arg1, sizeof(kernel_name_buffer))) {
+@@
+-        if (!access_ok(arg2, size)) {
++        if (!access_ok(0, arg2, size)) {
+@@
+-        if (!access_ok(arg2, len)) {
++        if (!access_ok(0, arg2, len)) {
+@@
+-        if (!access_ok(arg1, sizeof(kpm_name))) {
++        if (!access_ok(0, arg1, sizeof(kpm_name))) {
+@@
+-        if (!access_ok(arg2, sizeof(kpm_args))) {
++        if (!access_ok(0, arg2, sizeof(kpm_args))) {
+@@
+-    if (!access_ok(cmd.control_code, sizeof(int))) {
++    if (!access_ok(0, cmd.control_code, sizeof(int))) {
+@@
+-    if (!access_ok(cmd.result_code, sizeof(int))) {
++    if (!access_ok(0, cmd.result_code, sizeof(int))) {
+PATCH
 
-          echo "[INFO] Current .rej list (if any):"
-          find . -type f -name "*.rej" -maxdepth 6 -print || true
+          # 这个 patch 是“模糊匹配”写法（index 用假值），所以用 git apply --reject 不依赖 index
+          git apply --reject --whitespace=nowarn /tmp/kpm_access_ok_419.patch || true
 
-      # ----------------------------
-      # Apply your cmdline fix patch
-      # ----------------------------
-      - name: Apply SusFS cmdline fix (OnePlus8 4.19)
-        if: ${{ inputs.ENABLE_SUSFS }}
-        shell: bash
+          # 如果还有残留的 access_ok(XXX, YYY) 两参形式，直接做一次兜底替换：
+          # 只替换 "access_ok(" 后面没有逗号的第二个参数形式（非常保守）
+          if grep -nE 'access_ok\([^,]+\s*,\s*[^,]+\)' "$KPM_FILE" >/dev/null 2>&1; then
+            echo "Still found 2-arg access_ok calls, applying fallback sed..."
+            perl -0777 -i -pe 's/access_ok\(\s*([A-Za-z0-9_]+)\s*,\s*([^)]+?)\s*\)/access_ok(0, $1, $2)/g' "$KPM_FILE"
+          fi
+
+          echo "KPM access_ok fix done."
+          grep -n "access_ok" -n "$KPM_FILE" | head -n 50 || true
+
+      - name: Configure kernel
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          KDIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          cd "$KDIR"
+          export ARCH="${ARCH}"
+          export SUBARCH="${SUBARCH}"
 
-          FIX_PATCH="$GITHUB_WORKSPACE/patches/susfs_cmdline_oneplus8_419.patch"
-          if [ ! -f "$FIX_PATCH" ]; then
-            echo "[ERROR] Fix patch not found: $FIX_PATCH"
-            exit 1
-          fi
+          make O=out "${DEFCONFIG}"
+          # 如果你需要强制打开 KSU / KPM / SusFS 相关 config，可在这里追加 scripts/config（可选）
 
-          patch -p1 --forward < "$FIX_PATCH" || true
-
-          if find . -type f -name "*.rej" | grep -q .; then
-            echo "[WARN] .rej exists after cmdline fix (might be from SusFS main patch). Continue."
-          fi
-
-      # ----------------------------
-      # Fixups: 幂等插入 + 清理这两处对应的 .rej，然后检查是否还有其他 .rej
-      # ----------------------------
-      - name: Apply SusFS fixups (task_mmu + uname) and cleanup rejs
-        if: ${{ inputs.ENABLE_SUSFS }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-
-          echo "==> Fix task_mmu.c include"
-          TM="fs/proc/task_mmu.c"
-          if [ -f "$TM" ]; then
-            if ! grep -q "susfs_def.h" "$TM"; then
-              awk '
-                BEGIN{ins=0}
-                {print}
-                $0=="#include <linux/sched/signal.h>" && ins==0{
-                  print "#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP)"
-                  print "#include <linux/susfs_def.h>"
-                  print "#endif"
-                  ins=1
-                }
-              ' "$TM" > "$TM.tmp" && mv "$TM.tmp" "$TM"
-              if ! grep -q "susfs_def.h" "$TM"; then
-                awk '
-                  BEGIN{ins=0}
-                  {print}
-                  $0=="#include <linux/ctype.h>" && ins==0{
-                    print "#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP)"
-                    print "#include <linux/susfs_def.h>"
-                    print "#endif"
-                    ins=1
-                  }
-                ' "$TM" > "$TM.tmp" && mv "$TM.tmp" "$TM"
-              fi
-            fi
-            grep -q "susfs_def.h" "$TM" || { echo "[ERROR] task_mmu.c fix failed"; exit 1; }
-          else
-            echo "[WARN] $TM not found, skip."
-          fi
-
-          echo "==> Fix sys.c uname spoof hook"
-          SYS="kernel/sys.c"
-          if [ -f "$SYS" ]; then
-            if ! grep -q "susfs_spoof_uname" "$SYS"; then
-              awk '
-                BEGIN{added=0}
-                /SYSCALL_DEFINE1\(newuname/ && added==0{
-                  print "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME"
-                  print "extern void susfs_spoof_uname(struct new_utsname* tmp);"
-                  print "#endif"
-                  added=1
-                }
-                {print}
-              ' "$SYS" > "$SYS.tmp" && mv "$SYS.tmp" "$SYS"
-
-              awk '
-                BEGIN{done=0}
-                {print}
-                done==0 && $0 ~ /memcpy\(&tmp,.*sizeof\(tmp\)\);/{
-                  print "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME"
-                  print "\tsusfs_spoof_uname(&tmp);"
-                  print "#endif"
-                  done=1
-                }
-              ' "$SYS" > "$SYS.tmp" && mv "$SYS.tmp" "$SYS"
-            fi
-            grep -q "susfs_spoof_uname" "$SYS" || { echo "[ERROR] sys.c fix failed"; exit 1; }
-          else
-            echo "[WARN] $SYS not found, skip."
-          fi
-
-          echo "==> Cleanup known .rej (task_mmu/sys.c) because we applied them manually"
-          rm -f fs/proc/task_mmu.c.rej kernel/sys.c.rej || true
-
-          echo "==> Remaining .rej check"
-          REMAIN="$(find . -type f -name "*.rej" | wc -l | tr -d ' ')"
-          if [ "$REMAIN" != "0" ]; then
-            echo "[ERROR] Still have .rej files after fixups. Show first 200 lines:"
-            for r in $(find . -type f -name "*.rej"); do
-              echo "----- $r -----"
-              sed -n '1,200p' "$r" || true
-            done
-            exit 1
-          fi
-          echo "[OK] No remaining .rej files."
-
-      # ----------------------------
-      # Extensions (defconfig tweaks)
-      # ----------------------------
-      - name: Inject Kernel Extensions
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-          CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
-
-          set_kcfg() {
-            local key="$1"
-            local val="$2"
-            local file="$3"
-            if grep -qE "^${key}=" "$file"; then
-              sed -i "s/^${key}=.*/${key}=${val}/" "$file"
-            else
-              echo "${key}=${val}" >> "$file"
-            fi
-          }
-
-          if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then
-            curl -fLsS https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh | bash
-            set_kcfg "CONFIG_BBG" "y" "$CONFIG_FILE"
-            sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
-          fi
-
-          if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then
-            set_kcfg "CONFIG_NETFILTER_XT_TARGET_TTL" "y" "$CONFIG_FILE"
-            set_kcfg "CONFIG_NETFILTER_XT_TARGET_HL" "y" "$CONFIG_FILE"
-            set_kcfg "CONFIG_NETFILTER_XT_MATCH_HL" "y" "$CONFIG_FILE"
-            set_kcfg "CONFIG_NETFILTER_XT_MATCH_TPROXY" "y" "$CONFIG_FILE"
-          fi
-
-          if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then
-            set_kcfg "CONFIG_TCP_CONG_BBR" "y" "$CONFIG_FILE"
-            set_kcfg "CONFIG_DEFAULT_BBR" "y" "$CONFIG_FILE"
-            set_kcfg "CONFIG_IP_ECN" "y" "$CONFIG_FILE"
-            set_kcfg "CONFIG_TCP_ECN" "y" "$CONFIG_FILE"
-          fi
-
-      # ----------------------------
-      # Final override fragment (merge last)
-      # ----------------------------
-      - name: Write final config fragment (override)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-
-          FRAG="arch/arm64/configs/vendor/sukisu_override.config"
-          : > "$FRAG"
-
-          echo "CONFIG_KSU=y" >> "$FRAG"
-          echo "CONFIG_KPROBES=n" >> "$FRAG"
-          echo "CONFIG_KSU_MANUAL_SU=y" >> "$FRAG"
-
-          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
-            echo "CONFIG_KSU_SUSFS=y" >> "$FRAG"
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$FRAG"
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$FRAG"
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$FRAG"
-            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> "$FRAG"
-            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$FRAG"
-            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$FRAG"
-            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$FRAG"
-            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$FRAG"
-            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$FRAG"
-            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$FRAG"
-            echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> "$FRAG"
-          fi
-
-      # ----------------------------
-      # Build
-      # ----------------------------
       - name: Build kernel
-        shell: bash
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          KDIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          cd "$KDIR"
+          export ARCH="${ARCH}"
+          export SUBARCH="${SUBARCH}"
+          export CCACHE_DIR="${{ github.workspace }}/.ccache"
 
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export BRAND_SHOW_FLAG=oneplus
-          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH"
-          export KBUILD_BUILD_HOST=Github-Action
-          export KBUILD_BUILD_USER="$(echo "${{ github.actor }}" | tr A-Z a-z)"
+          make -j"$(nproc)" O=out
 
-          BA_ARGS=(CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-)
-          EX_ARGS=(LD=ld.lld LLVM=1 LLVM_IAS=1)
-
-          make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" vendor/kona-perf_defconfig
-
-          FRAGS=()
-          for f in \
-            arch/arm64/configs/vendor/debugfs.config \
-            arch/arm64/configs/vendor/oplus.config \
-            arch/arm64/configs/vendor/sukisu_override.config
-          do
-            if [ -f "$f" ]; then
-              FRAGS+=("$f")
-            fi
-          done
-
-          if [ "${#FRAGS[@]}" -gt 0 ]; then
-            bash scripts/kconfig/merge_config.sh -m -O out out/.config "${FRAGS[@]}"
-            make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
-          fi
-
-          if [ "${{ inputs.ENABLE_KPM }}" = "true" ]; then
-            if grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config; then
-              if grep -q '^# CONFIG_KPM is not set' out/.config; then
-                sed -i 's/^# CONFIG_KPM is not set/CONFIG_KPM=y/' out/.config
-              elif grep -q '^CONFIG_KPM=' out/.config; then
-                sed -i 's/^CONFIG_KPM=.*/CONFIG_KPM=y/' out/.config
-              fi
-            fi
-            make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
-          fi
-
-          make -j"$(nproc --all)" O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" 2>&1 | tee error.log
-
-          grep -q '^CONFIG_KSU=y' out/.config
-          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
-            grep -q '^CONFIG_KSU_SUSFS=y' out/.config
-          fi
-
-      # ----------------------------
-      # KPM Inline Patcher
-      # ----------------------------
-      - name: KPM Inline Patcher
-        if: ${{ success() && inputs.ENABLE_KPM }}
-        shell: bash
+      - name: Collect artifacts
         run: |
           set -euo pipefail
-          IMAGE_DIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel/out/arch/arm64/boot"
+          KDIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          OUT="$KDIR/out"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
 
-          MODE=""
-          if [ -f "$IMAGE_DIR/Image.gz-dtb" ]; then
-            MODE="gz-dtb"
-          elif [ -f "$IMAGE_DIR/Image.gz" ]; then
-            MODE="gz"
-          elif [ -f "$IMAGE_DIR/Image" ]; then
-            MODE="plain"
-          else
-            echo "[ERROR] No Image/Image.gz/Image.gz-dtb found in $IMAGE_DIR"
-            ls -la "$IMAGE_DIR" || true
-            exit 1
+          # 常见产物路径（按你的 kernel tree 可能不同，至少把 Image 兜底打包）
+          if [ -f "$OUT/arch/arm64/boot/Image" ]; then
+            cp -v "$OUT/arch/arm64/boot/Image" "$GITHUB_WORKSPACE/artifacts/"
+          fi
+          if [ -f "$OUT/arch/arm64/boot/Image.gz" ]; then
+            cp -v "$OUT/arch/arm64/boot/Image.gz" "$GITHUB_WORKSPACE/artifacts/"
+          fi
+          if [ -f "$OUT/arch/arm64/boot/Image.gz-dtb" ]; then
+            cp -v "$OUT/arch/arm64/boot/Image.gz-dtb" "$GITHUB_WORKSPACE/artifacts/"
           fi
 
-          cd "$IMAGE_DIR"
-          curl -fLsS -o patch "${KPM_PATCH_URL}"
-          chmod +x patch
+          (cd "$GITHUB_WORKSPACE/artifacts" && ls -lah)
 
-          case "$MODE" in
-            gz-dtb)
-              DTB_DIR=""
-              if ls "$IMAGE_DIR/dts/qcom/"*.dtb 1>/dev/null 2>&1; then
-                DTB_DIR="$IMAGE_DIR/dts/qcom"
-              elif ls "$IMAGE_DIR/dts/vendor/qcom/"*.dtb 1>/dev/null 2>&1; then
-                DTB_DIR="$IMAGE_DIR/dts/vendor/qcom"
-              fi
-
-              rm -f Image.gz-dtb Image.gz || true
-              ./patch || true
-
-              [ -f oImage ] || { echo "[ERROR] KPM patch did not produce oImage."; exit 1; }
-
-              mv -f oImage Image
-              gzip -c Image > Image.gz
-
-              if [ -n "$DTB_DIR" ]; then
-                cat Image.gz "$DTB_DIR/"*.dtb > Image.gz-dtb
-              fi
-              ;;
-            gz)
-              rm -f Image.gz || true
-              ./patch || true
-              [ -f oImage ] || { echo "[ERROR] KPM patch did not produce oImage."; exit 1; }
-              mv -f oImage Image
-              gzip -c Image > Image.gz
-              ;;
-            plain)
-              ./patch || true
-              [ -f oImage ] || { echo "[ERROR] KPM patch did not produce oImage."; exit 1; }
-              mv -f oImage Image
-              ;;
-          esac
-
-      - name: Check kernel output
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel/out"
-          [ -f arch/arm64/boot/Image ] || { echo "Kernel output file is empty"; exit 1; }
-          echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> "$GITHUB_ENV"
-
-      - name: Upload debug artifacts (always)
-        if: always()
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: debug-artifacts
-          path: |
-            kernel_workspace/android-kernel/out/.config
-            kernel_workspace/android-kernel/error.log
-            kernel_workspace/android-kernel/**/*.rej
-            kernel_workspace/android-kernel/**/*.orig
-            kernel_workspace/android-kernel/out/arch/arm64/boot/Image
-            kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz
-            kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz-dtb
-          if-no-files-found: ignore
-
-      # ----------------------------
-      # Package (AnyKernel3)
-      # ----------------------------
-      - name: Prepare AnyKernel3 and package
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace"
-
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3
-
-          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
-          sed -i 's!BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!BLOCK=auto;!g' AnyKernel3/anykernel.sh
-          sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' AnyKernel3/anykernel.sh
-
-          rm -rf AnyKernel3/.git* AnyKernel3/README.md
-          cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
-          cd AnyKernel3
-
-          SUS_TAG=""
-          [ "${{ inputs.ENABLE_SUSFS }}" = "true" ] && SUS_TAG="-SusFS"
-          KPM_TAG=""
-          [ "${{ inputs.ENABLE_KPM }}" = "true" ] && KPM_TAG="-KPM"
-
-          ZIP="AK3-${{ inputs.LINEAGE_BRANCH }}-OPlus-SM8250-SukiSU${SUS_TAG}${KPM_TAG}_${{ env.SUKISU_VER }}_${{ env.SUKISU_COMMIT }}.zip"
-          zip -r "$ZIP" ./*
-          echo "ZIP_NAME=$ZIP" >> "$GITHUB_ENV"
-
-      - name: Upload AnyKernel3 ZIP (GitHub Artifact)
-        uses: actions/upload-artifact@v4
-        with:
-          name: AK3-SukiSU
-          path: kernel_workspace/AnyKernel3/*.zip
-
-      # ----------------------------
-      # Telegram notify (NO secrets in if:)
-      # ----------------------------
-      - name: Send Success to Telegram
-        if: success()
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -z "${TELEGRAM_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-            echo "Telegram secrets not set, skipping notify."
-            exit 0
-          fi
-
-          cd "$GITHUB_WORKSPACE/kernel_workspace/AnyKernel3"
-          SUSFS_STATUS="❌"; [ "${{ inputs.ENABLE_SUSFS }}" = "true" ] && SUSFS_STATUS="✅"
-          KPM_STATUS="❌";   [ "${{ inputs.ENABLE_KPM }}" = "true" ] && KPM_STATUS="✅"
-
-          CAPTION="$(printf "✅ Kernel Build Success!\n\nBranch: %s\nKernel Version: %s\nSukiSU Ref: %s\nSukiSU Ver: %s (%s)\n\nSusFS: %s\nKPM: %s\n" \
-            "${{ inputs.LINEAGE_BRANCH }}" "${{ env.KERNEL_VERSION }}" "${{ env.SUKISU_REF }}" "${{ env.SUKISU_VER }}" "${{ env.SUKISU_COMMIT }}" \
-            "${SUSFS_STATUS}" "${KPM_STATUS}")"
-
-          curl -sS -F chat_id="$TELEGRAM_CHAT_ID" \
-            -F document=@"${{ env.ZIP_NAME }}" \
-            --form-string caption="$CAPTION" \
-            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument"
-
-      - name: Send Failure to Telegram
-        if: failure()
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -z "${TELEGRAM_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-            echo "Telegram secrets not set, skipping notify."
-            exit 0
-          fi
-
-          MESSAGE="$(printf "❌ Kernel Build Failed!\n\nBranch: %s\nBuild User: %s\n\nLogs: %s/%s/actions/runs/%s\n" \
-            "${{ inputs.LINEAGE_BRANCH }}" "${{ github.actor }}" "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")"
-
-          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-            -d chat_id="$TELEGRAM_CHAT_ID" \
-            --data-urlencode text="$MESSAGE"
+          name: kernel-artifacts
+          path: artifacts/*
