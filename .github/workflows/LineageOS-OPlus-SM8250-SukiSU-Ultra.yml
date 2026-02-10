@@ -81,12 +81,22 @@ jobs:
           KPM_FILE="${GITHUB_WORKSPACE}/kernel_workspace/android-kernel/drivers/kernelsu/kpm/kpm.c"
           test -f "${KPM_FILE}"
 
-          python3 -c "import re,pathlib; p=pathlib.Path(r'${KPM_FILE}'); s=p.read_text(encoding='utf-8',errors='ignore'); \
-pat=re.compile(r'access_ok\\s*\\(\\s*([^,()]+?)\\s*,\\s*([^)]+?)\\s*\\)'); \
-s2=pat.sub(lambda m: f'access_ok(0, {m.group(1).strip()}, {m.group(2).strip()})', s); \
-p.write_text(s2, encoding='utf-8'); print('patched access_ok calls:', len(pat.findall(s)))"
+          python3 - <<'PY'
+          import re
+          import pathlib
 
-          grep -n "access_ok" "${KPM_FILE}" | head -n 50 || true
+          p = pathlib.Path(r"""'"${KPM_FILE}"'""")
+          s = p.read_text(encoding="utf-8", errors="ignore")
+
+          # access_ok(addr, size)  ->  access_ok(0, addr, size)   (arm64 4.19: access_ok(type, addr, size))
+          pat = re.compile(r'access_ok\s*\(\s*([^,()]+?)\s*,\s*([^)]+?)\s*\)')
+          s2 = pat.sub(lambda m: f'access_ok(0, {m.group(1).strip()}, {m.group(2).strip()})', s)
+
+          p.write_text(s2, encoding="utf-8")
+          print("patched access_ok calls:", len(pat.findall(s)))
+          PY
+
+          grep -n "access_ok" "${KPM_FILE}" | head -n 80 || true
 
       - name: Configure kernel
         run: |
