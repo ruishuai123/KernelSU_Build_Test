@@ -37,6 +37,10 @@ env:
   CLANG_VERSION: clang-r547379
   GCC_TAG: android-12.1.0_r27
 
+  # SusFS patch source (对标成功项目)
+  SUSFS_PATCH_REPO: JackA1ltman/NonGKI_Kernel_Patches
+  SUSFS_PATCH_BRANCH: mi_kernel
+
 jobs:
   build:
     name: Build Kernel (SukiSU-Ultra)
@@ -151,6 +155,61 @@ jobs:
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
       # ----------------------------
+      # SusFS patch (对标成功项目：不仅开config，还要patch源码)
+      # ----------------------------
+      - name: Patch SusFS (kernel source patch)
+        if: ${{ inputs.ENABLE_SUSFS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+
+          # 如果已经patch过，跳过
+          if grep -q "CONFIG_KSU_SUSFS" fs/namespace.c 2>/dev/null; then
+            echo "[INFO] SusFS seems already patched in fs/namespace.c, skipping."
+            exit 0
+          fi
+
+          # 识别内核版本 (major.minor)
+          MAJOR="$(awk -F' = ' '/^VERSION =/{print $2}' Makefile)"
+          MINOR="$(awk -F' = ' '/^PATCHLEVEL =/{print $2}' Makefile)"
+          KV="${MAJOR}.${MINOR}"
+          echo "Detected kernel version: ${KV}"
+
+          rm -rf NonGKI_Kernel_Patches
+          git clone --depth=1 -b "${SUSFS_PATCH_BRANCH}" "https://github.com/${SUSFS_PATCH_REPO}.git" NonGKI_Kernel_Patches
+
+          # 兼容两种常见目录结构
+          PATCH_FILE=""
+          if [ -f "NonGKI_Kernel_Patches/Patch/susfs_patch_to_${KV}.patch" ]; then
+            PATCH_FILE="NonGKI_Kernel_Patches/Patch/susfs_patch_to_${KV}.patch"
+          elif [ -f "NonGKI_Kernel_Patches/susfs_patch_to_${KV}.patch" ]; then
+            PATCH_FILE="NonGKI_Kernel_Patches/susfs_patch_to_${KV}.patch"
+          fi
+
+          if [ -z "$PATCH_FILE" ]; then
+            echo "[ERROR] Cannot find susfs_patch_to_${KV}.patch in ${SUSFS_PATCH_REPO}@${SUSFS_PATCH_BRANCH}"
+            echo "[HINT] Available susfs patches (top 30):"
+            find NonGKI_Kernel_Patches -maxdepth 4 -type f -name '*susfs*patch*' | head -n 30 || true
+            exit 1
+          fi
+
+          echo "[INFO] Applying patch: $PATCH_FILE"
+          patch -p1 < "$PATCH_FILE" || true
+
+          # 如果出现rej，打印并失败（对标成功项目行为）
+          if find . -type f -name "*.rej" | grep -q .; then
+            echo "[ERROR] Patch rejected (.rej found). Showing first 200 lines of each rej:"
+            for r in $(find . -type f -name "*.rej"); do
+              echo "----- $r -----"
+              sed -n '1,200p' "$r" || true
+            done
+            exit 1
+          fi
+
+          echo "[OK] SusFS patch applied."
+
+      # ----------------------------
       # Extensions
       # ----------------------------
       - name: Inject Kernel Extensions
@@ -244,21 +303,32 @@ jobs:
           # 1) 先生成基础 defconfig
           make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" vendor/kona-perf_defconfig
 
-          # 2) 合并 fragment（config 片段不是 make target）
-          FRAGS=(
-            arch/arm64/configs/vendor/debugfs.config
-            arch/arm64/configs/vendor/oplus.config
+          # 2) 合并 fragment（不存在则跳过，避免直接失败）
+          FRAGS=()
+          for f in \
+            arch/arm64/configs/vendor/debugfs.config \
+            arch/arm64/configs/vendor/oplus.config \
             arch/arm64/configs/vendor/sukisu_override.config
-          )
-          bash scripts/kconfig/merge_config.sh -m -O out out/.config "${FRAGS[@]}"
+          do
+            if [ -f "$f" ]; then
+              echo "[INFO] merge fragment: $f"
+              FRAGS+=("$f")
+            else
+              echo "[WARN] fragment missing, skip: $f"
+            fi
+          done
 
-          # 3) 补齐依赖
-          make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
+          if [ "${#FRAGS[@]}" -gt 0 ]; then
+            bash scripts/kconfig/merge_config.sh -m -O out out/.config "${FRAGS[@]}"
+            make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
+          else
+            echo "[WARN] No fragments merged."
+          fi
 
-          # 4) 编译
-          make -j"$(nproc --all)" O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}"
+          # 3) 编译（tee 出 error.log，方便定位）
+          make -j"$(nproc --all)" O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" 2>&1 | tee error.log
 
-          # 5) 断言配置生效
+          # 4) 断言配置生效
           if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
             grep -q '^CONFIG_KSU=y' out/.config
             grep -q '^CONFIG_KSU_SUSFS=y' out/.config
@@ -278,6 +348,19 @@ jobs:
             echo "Kernel output file is empty"
             exit 1
           fi
+
+      # 失败/成功都上传关键产物 + 日志
+      - name: Upload debug artifacts (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts
+          path: |
+            kernel_workspace/android-kernel/out/.config
+            kernel_workspace/android-kernel/error.log
+            kernel_workspace/android-kernel/**/*.rej
+            kernel_workspace/android-kernel/**/*.orig
+          if-no-files-found: ignore
 
       # ----------------------------
       # Package (AnyKernel3)
@@ -315,7 +398,7 @@ jobs:
           path: kernel_workspace/AnyKernel3/*.zip
 
       # ----------------------------
-      # Telegram notify (NO heredoc, NO secrets in if:)
+      # Telegram notify
       # ----------------------------
       - name: Send Success to Telegram
         if: success()
