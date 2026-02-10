@@ -8,17 +8,15 @@ jobs:
     runs-on: ubuntu-22.04
 
     env:
-      # ===== 你只需要改这里 3 个 =====
+      # ===== 按你自己的仓库改这 3 个 =====
       KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8250.git
       KERNEL_BRANCH: android12
       DEFCONFIG: vendor/kona_defconfig
-      # =============================
+      # ===================================
 
-      # SukiSU-Ultra
       SUKISU_REPO: https://github.com/SukiSU-Ultra/SukiSU-Ultra.git
       SUKISU_BRANCH: main
 
-      # Build
       ARCH: arm64
       SUBARCH: arm64
       CCACHE_COMPRESS: "1"
@@ -52,9 +50,6 @@ jobs:
           mkdir -p kernel_workspace
           cd kernel_workspace
           git clone --depth=1 -b "${KERNEL_BRANCH}" "${KERNEL_REPO}" android-kernel
-          cd android-kernel
-          echo "Kernel top: $(pwd)"
-          uname -a
 
       - name: Clone SukiSU-Ultra
         run: |
@@ -62,152 +57,92 @@ jobs:
           cd kernel_workspace
           rm -rf sukisu
           git clone --depth=1 -b "${SUKISU_BRANCH}" "${SUKISU_REPO}" sukisu
-          echo "SukiSU-Ultra cloned."
 
-      # === 集成 SukiSU-Ultra（按常见方式：把 drivers/kernelsu 放进内核树）
       - name: Integrate SukiSU-Ultra into kernel tree
         run: |
           set -euo pipefail
-          KDIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-          SDIR="$GITHUB_WORKSPACE/kernel_workspace/sukisu"
+          KDIR="${GITHUB_WORKSPACE}/kernel_workspace/android-kernel"
+          SDIR="${GITHUB_WORKSPACE}/kernel_workspace/sukisu"
 
-          # 这里假设 SukiSU-Ultra 的 KernelSU 源在仓库内的 drivers/kernelsu
-          # 如果它目录结构不同，你只需要改下面这两行 cp 的来源路径即可
-          rm -rf "$KDIR/drivers/kernelsu"
-          mkdir -p "$KDIR/drivers"
-          cp -a "$SDIR/drivers/kernelsu" "$KDIR/drivers/"
+          rm -rf "${KDIR}/drivers/kernelsu"
+          mkdir -p "${KDIR}/drivers"
+          cp -a "${SDIR}/drivers/kernelsu" "${KDIR}/drivers/"
 
-          # Kconfig / Makefile 挂载（若已存在则不重复）
-          if ! grep -q 'drivers/kernelsu/Kconfig' "$KDIR/drivers/Kconfig"; then
-            echo 'source "drivers/kernelsu/Kconfig"' >> "$KDIR/drivers/Kconfig"
-          fi
-          if ! grep -q 'kernelsu/' "$KDIR/drivers/Makefile"; then
-            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> "$KDIR/drivers/Makefile"
+          if ! grep -q 'drivers/kernelsu/Kconfig' "${KDIR}/drivers/Kconfig"; then
+            echo 'source "drivers/kernelsu/Kconfig"' >> "${KDIR}/drivers/Kconfig"
           fi
 
-          echo "Integrated SukiSU-Ultra into kernel."
+          if ! grep -q 'obj-$(CONFIG_KSU) += kernelsu/' "${KDIR}/drivers/Makefile"; then
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> "${KDIR}/drivers/Makefile"
+          fi
 
-      # === 应用你仓库内的 SusFS 补丁（你已经新增好了那两个 patch 文件）
       - name: Apply SusFS patches (OnePlus 8 / 4.19)
         run: |
           set -euo pipefail
-          KDIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-          cd "$KDIR"
+          KDIR="${GITHUB_WORKSPACE}/kernel_workspace/android-kernel"
+          cd "${KDIR}"
 
-          echo "Applying: patches/susfs_cmdline_oneplus8_419.patch"
-          git apply --verbose "$GITHUB_WORKSPACE/patches/susfs_cmdline_oneplus8_419.patch"
+          git apply --verbose "${GITHUB_WORKSPACE}/patches/susfs_cmdline_oneplus8_419.patch"
+          git apply --verbose "${GITHUB_WORKSPACE}/patches/susfs_fixups_oneplus8_419.patch"
 
-          echo "Applying: patches/susfs_fixups_oneplus8_419.patch"
-          git apply --verbose "$GITHUB_WORKSPACE/patches/susfs_fixups_oneplus8_419.patch"
-
-          echo "SusFS patches applied."
-
-      # === 关键：修复 KPM 在 4.19 上的 access_ok 参数不匹配（2参 -> 3参）
-      - name: Fix KPM access_ok for arm64 4.19 (patch inline)
+      - name: Fix KPM access_ok for arm64 4.19 (2-arg -> 3-arg)
         run: |
           set -euo pipefail
-          KDIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-          cd "$KDIR"
+          KPM_FILE="${GITHUB_WORKSPACE}/kernel_workspace/android-kernel/drivers/kernelsu/kpm/kpm.c"
+          test -f "${KPM_FILE}"
 
-          KPM_FILE="drivers/kernelsu/kpm/kpm.c"
-          if [ ! -f "$KPM_FILE" ]; then
-            echo "ERROR: $KPM_FILE not found. SukiSU-Ultra integrate step may be wrong."
-            exit 1
-          fi
+          python3 - <<'PY'
+import re, pathlib
+p = pathlib.Path(r"""${GITHUB_WORKSPACE}/kernel_workspace/android-kernel/drivers/kernelsu/kpm/kpm.c""")
+s = p.read_text(encoding="utf-8", errors="ignore")
 
-          cat > /tmp/kpm_access_ok_419.patch <<'PATCH'
-diff --git a/drivers/kernelsu/kpm/kpm.c b/drivers/kernelsu/kpm/kpm.c
-index 0000000..1111111 100644
---- a/drivers/kernelsu/kpm/kpm.c
-+++ b/drivers/kernelsu/kpm/kpm.c
-@@ -1,3 +1,4 @@
-+/* NOTE: patched for kernel 4.19 arm64 access_ok(type, addr, size) */
-@@
--        if (!access_ok(arg1, 255)) {
-+        if (!access_ok(0, arg1, 255)) {
-@@
--            if (!access_ok(arg2, 255)) {
-+            if (!access_ok(0, arg2, 255)) {
-@@
--        if (!access_ok(arg1, sizeof(kernel_name_buffer))) {
-+        if (!access_ok(0, arg1, sizeof(kernel_name_buffer))) {
-@@
--        if (!access_ok(arg1, sizeof(kernel_name_buffer))) {
-+        if (!access_ok(0, arg1, sizeof(kernel_name_buffer))) {
-@@
--        if (!access_ok(arg2, size)) {
-+        if (!access_ok(0, arg2, size)) {
-@@
--        if (!access_ok(arg2, len)) {
-+        if (!access_ok(0, arg2, len)) {
-@@
--        if (!access_ok(arg1, sizeof(kpm_name))) {
-+        if (!access_ok(0, arg1, sizeof(kpm_name))) {
-@@
--        if (!access_ok(arg2, sizeof(kpm_args))) {
-+        if (!access_ok(0, arg2, sizeof(kpm_args))) {
-@@
--    if (!access_ok(cmd.control_code, sizeof(int))) {
-+    if (!access_ok(0, cmd.control_code, sizeof(int))) {
-@@
--    if (!access_ok(cmd.result_code, sizeof(int))) {
-+    if (!access_ok(0, cmd.result_code, sizeof(int))) {
-PATCH
+# 把 access_ok(addr, size) -> access_ok(0, addr, size)
+# 只替换“逗号只有一个”的两参形式，避免误伤三参。
+pattern = re.compile(r'access_ok\s*\(\s*([^,()]+?)\s*,\s*([^)]+?)\s*\)')
+def repl(m):
+    a = m.group(1).strip()
+    b = m.group(2).strip()
+    return f'access_ok(0, {a}, {b})'
+s2 = pattern.sub(repl, s)
 
-          # 这个 patch 是“模糊匹配”写法（index 用假值），所以用 git apply --reject 不依赖 index
-          git apply --reject --whitespace=nowarn /tmp/kpm_access_ok_419.patch || true
+p.write_text(s2, encoding="utf-8")
+print("patched access_ok() calls:", len(pattern.findall(s)))
+PY
 
-          # 如果还有残留的 access_ok(XXX, YYY) 两参形式，直接做一次兜底替换：
-          # 只替换 "access_ok(" 后面没有逗号的第二个参数形式（非常保守）
-          if grep -nE 'access_ok\([^,]+\s*,\s*[^,]+\)' "$KPM_FILE" >/dev/null 2>&1; then
-            echo "Still found 2-arg access_ok calls, applying fallback sed..."
-            perl -0777 -i -pe 's/access_ok\(\s*([A-Za-z0-9_]+)\s*,\s*([^)]+?)\s*\)/access_ok(0, $1, $2)/g' "$KPM_FILE"
-          fi
-
-          echo "KPM access_ok fix done."
-          grep -n "access_ok" -n "$KPM_FILE" | head -n 50 || true
+          # 打印几行确认
+          grep -n "access_ok" "${KPM_FILE}" | head -n 50 || true
 
       - name: Configure kernel
         run: |
           set -euo pipefail
-          KDIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-          cd "$KDIR"
-          export ARCH="${ARCH}"
-          export SUBARCH="${SUBARCH}"
-
+          KDIR="${GITHUB_WORKSPACE}/kernel_workspace/android-kernel"
+          cd "${KDIR}"
           make O=out "${DEFCONFIG}"
-          # 如果你需要强制打开 KSU / KPM / SusFS 相关 config，可在这里追加 scripts/config（可选）
 
       - name: Build kernel
         run: |
           set -euo pipefail
-          KDIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-          cd "$KDIR"
-          export ARCH="${ARCH}"
-          export SUBARCH="${SUBARCH}"
-          export CCACHE_DIR="${{ github.workspace }}/.ccache"
-
+          KDIR="${GITHUB_WORKSPACE}/kernel_workspace/android-kernel"
+          cd "${KDIR}"
           make -j"$(nproc)" O=out
 
       - name: Collect artifacts
         run: |
           set -euo pipefail
-          KDIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-          OUT="$KDIR/out"
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          OUT="${GITHUB_WORKSPACE}/kernel_workspace/android-kernel/out"
+          mkdir -p "${GITHUB_WORKSPACE}/artifacts"
 
-          # 常见产物路径（按你的 kernel tree 可能不同，至少把 Image 兜底打包）
-          if [ -f "$OUT/arch/arm64/boot/Image" ]; then
-            cp -v "$OUT/arch/arm64/boot/Image" "$GITHUB_WORKSPACE/artifacts/"
-          fi
-          if [ -f "$OUT/arch/arm64/boot/Image.gz" ]; then
-            cp -v "$OUT/arch/arm64/boot/Image.gz" "$GITHUB_WORKSPACE/artifacts/"
-          fi
-          if [ -f "$OUT/arch/arm64/boot/Image.gz-dtb" ]; then
-            cp -v "$OUT/arch/arm64/boot/Image.gz-dtb" "$GITHUB_WORKSPACE/artifacts/"
-          fi
+          for f in \
+            "${OUT}/arch/arm64/boot/Image" \
+            "${OUT}/arch/arm64/boot/Image.gz" \
+            "${OUT}/arch/arm64/boot/Image.gz-dtb"
+          do
+            if [ -f "$f" ]; then
+              cp -v "$f" "${GITHUB_WORKSPACE}/artifacts/"
+            fi
+          done
 
-          (cd "$GITHUB_WORKSPACE/artifacts" && ls -lah)
+          ls -lah "${GITHUB_WORKSPACE}/artifacts" || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
