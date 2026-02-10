@@ -158,12 +158,11 @@ jobs:
           echo "SUKISU_VER=$SUKISU_VER" >> "$GITHUB_ENV"
           echo "SUKISU_COMMIT=$SUKISU_COMMIT" >> "$GITHUB_ENV"
 
-          # 允许失败：保留你原来的额外 patch
           bash "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" || true
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
       # ----------------------------
-      # SusFS kernel patch (源码补丁) - 不需要用户填任何参数
+      # SusFS kernel patch (源码补丁) - 自动选择 oneplus8/cos15
       # ----------------------------
       - name: Patch SusFS (kernel source patch, auto pick oneplus8)
         if: ${{ inputs.ENABLE_SUSFS }}
@@ -180,7 +179,6 @@ jobs:
           rm -rf NonGKI_Kernel_Patches
           git clone --depth=1 -b "${SUSFS_PATCH_BRANCH}" "https://github.com/${SUSFS_PATCH_REPO}.git" NonGKI_Kernel_Patches
 
-          # 固定优先：oneplus8/cos15 目录
           FILE="susfs_fixed.patch"
           PATCH_FILE=""
 
@@ -198,7 +196,6 @@ jobs:
             fi
           done
 
-          # 最终兜底：全仓库找一个 susfs_fixed.patch
           if [ -z "$PATCH_FILE" ]; then
             PATCH_FILE="$(find NonGKI_Kernel_Patches -maxdepth 4 -type f -name 'susfs_fixed.patch' | head -n 1 || true)"
           fi
@@ -252,6 +249,88 @@ jobs:
           fi
 
           echo "[OK] Local cmdline fix applied or already applied."
+
+      # ----------------------------
+      # NEW: Apply SusFS fixups for your kernel tree (task_mmu + uname spoof)
+      # ----------------------------
+      - name: Apply SusFS fixups (task_mmu + uname)
+        if: ${{ inputs.ENABLE_SUSFS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+
+          echo "==> Fix 1/2: fs/proc/task_mmu.c include <linux/susfs_def.h>"
+          TM="fs/proc/task_mmu.c"
+          if [ -f "$TM" ]; then
+            if grep -q "susfs_def.h" "$TM"; then
+              echo "[INFO] susfs_def.h already present, skip."
+            else
+              # 尝试在 linux/sched/signal.h 后插入；找不到就插到 includes 末尾附近
+              if grep -q "^#include <linux/sched/signal.h>" "$TM"; then
+                awk '
+                  {print}
+                  $0=="#include <linux/sched/signal.h>"{
+                    print "#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP)"
+                    print "#include <linux/susfs_def.h>"
+                    print "#endif"
+                  }
+                ' "$TM" > "$TM.tmp" && mv "$TM.tmp" "$TM"
+              else
+                # 找一个相对稳定的 include 行（ctype 或 mm_inline），插在它后面
+                awk '
+                  {print}
+                  (!done && ($0=="#include <linux/ctype.h>" || $0=="#include <linux/mm_inline.h>")) {
+                    print "#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP)"
+                    print "#include <linux/susfs_def.h>"
+                    print "#endif"
+                    done=1
+                  }
+                ' "$TM" > "$TM.tmp" && mv "$TM.tmp" "$TM"
+              fi
+              grep -n "susfs_def.h" "$TM" || { echo "[ERROR] failed to insert susfs_def.h"; exit 1; }
+              echo "[OK] task_mmu.c fixed."
+            fi
+          else
+            echo "[WARN] $TM not found, skip."
+          fi
+
+          echo "==> Fix 2/2: kernel/sys.c uname spoof hook"
+          SYS="kernel/sys.c"
+          if [ -f "$SYS" ]; then
+            if grep -q "susfs_spoof_uname" "$SYS"; then
+              echo "[INFO] susfs_spoof_uname already present, skip."
+            else
+              # 2a) 加 extern 声明：插在 SYSCALL_DEFINE1(newuname...) 之前（更稳）
+              awk '
+                BEGIN{added=0}
+                /SYSCALL_DEFINE1\(newuname/ && added==0 {
+                  print "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME"
+                  print "extern void susfs_spoof_uname(struct new_utsname* tmp);"
+                  print "#endif"
+                  added=1
+                }
+                {print}
+              ' "$SYS" > "$SYS.tmp" && mv "$SYS.tmp" "$SYS"
+
+              # 2b) 在 memcpy(&tmp, utsname(), sizeof(tmp)); 后插入调用
+              awk '
+                BEGIN{done=0}
+                {print}
+                (!done && $0 ~ /memcpy\(&tmp,.*utsname\(\).*\);/) {
+                  print "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME"
+                  print "\tsusfs_spoof_uname(&tmp);"
+                  print "#endif"
+                  done=1
+                }
+              ' "$SYS" > "$SYS.tmp" && mv "$SYS.tmp" "$SYS"
+
+              grep -n "susfs_spoof_uname" "$SYS" || { echo "[ERROR] failed to insert uname spoof"; exit 1; }
+              echo "[OK] sys.c fixed."
+            fi
+          else
+            echo "[WARN] $SYS not found, skip."
+          fi
 
       # ----------------------------
       # Extensions (defconfig tweaks)
