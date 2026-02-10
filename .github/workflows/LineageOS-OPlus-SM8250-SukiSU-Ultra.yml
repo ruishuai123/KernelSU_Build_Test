@@ -14,16 +14,6 @@ on:
         type: boolean
         default: true
 
-      # 可选：指定 SusFS Patch 目录/文件（来自 JackA1ltman/NonGKI_Kernel_Patches）
-      SUSFS_PATCH_DIR:
-        description: "SusFS Patch 目录（可选，如 kona_cos15_a15）。留空则自动挑一个 *_419/susfs_fixed.patch"
-        required: false
-        default: ""
-      SUSFS_PATCH_FILE:
-        description: "SusFS Patch 文件（可选，如 susfs_fixed.patch 或 susfs_155_fixed.patch）。留空默认 susfs_fixed.patch"
-        required: false
-        default: ""
-
       ENABLE_KPM:
         description: "启用 KPM Inline（会尝试注入到 Image/Image.gz/Image.gz-dtb）"
         required: true
@@ -53,11 +43,11 @@ env:
   CLANG_VERSION: clang-r547379
   GCC_TAG: android-12.1.0_r27
 
-  # SusFS patch repo（对标 oneplus8 成功 workflow：用 op_kernel 分支更合适）
+  # SusFS patch repo（OnePlus 8 参考项目用 op_kernel 分支）
   SUSFS_PATCH_REPO: JackA1ltman/NonGKI_Kernel_Patches
   SUSFS_PATCH_BRANCH: op_kernel
 
-  # KPM patcher（下载可执行 patch_linux）
+  # KPM patcher
   KPM_PATCH_URL: https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/refs/heads/main/kpm/patch_linux
 
 jobs:
@@ -168,24 +158,19 @@ jobs:
           echo "SUKISU_VER=$SUKISU_VER" >> "$GITHUB_ENV"
           echo "SUKISU_COMMIT=$SUKISU_COMMIT" >> "$GITHUB_ENV"
 
+          # 允许失败：保留你原来的额外 patch
           bash "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" || true
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
       # ----------------------------
-      # SusFS kernel patch (源码补丁)
+      # SusFS kernel patch (源码补丁) - 不需要用户填任何参数
       # ----------------------------
-      - name: Patch SusFS (kernel source patch)
+      - name: Patch SusFS (kernel source patch, auto pick oneplus8)
         if: ${{ inputs.ENABLE_SUSFS }}
         shell: bash
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-
-          # 如果已经 patch 过（简单启发式），跳过
-          if grep -q "CONFIG_KSU_SUSFS" fs/namespace.c 2>/dev/null; then
-            echo "[INFO] SusFS seems already patched in fs/namespace.c, skipping."
-            exit 0
-          fi
 
           MAJOR="$(awk -F' = ' '/^VERSION =/{print $2}' Makefile)"
           MINOR="$(awk -F' = ' '/^PATCHLEVEL =/{print $2}' Makefile)"
@@ -195,48 +180,41 @@ jobs:
           rm -rf NonGKI_Kernel_Patches
           git clone --depth=1 -b "${SUSFS_PATCH_BRANCH}" "https://github.com/${SUSFS_PATCH_REPO}.git" NonGKI_Kernel_Patches
 
-          DIR="${{ inputs.SUSFS_PATCH_DIR }}"
-          FILE="${{ inputs.SUSFS_PATCH_FILE }}"
-
-          if [ -z "$FILE" ]; then
-            FILE="susfs_fixed.patch"
-          fi
-
+          # 固定优先：oneplus8/cos15 目录
+          FILE="susfs_fixed.patch"
           PATCH_FILE=""
-          if [ -n "$DIR" ]; then
-            CAND="NonGKI_Kernel_Patches/${DIR}/${FILE}"
-            if [ -f "$CAND" ]; then
-              PATCH_FILE="$CAND"
-              echo "[INFO] Using user-specified patch: $PATCH_FILE"
-            else
-              echo "[ERROR] Specified patch not found: $CAND"
-              echo "[HINT] Candidates (top 50):"
-              find NonGKI_Kernel_Patches -maxdepth 4 -type f -name 'susfs*_fixed*.patch' | head -n 50 || true
-              exit 1
-            fi
-          else
-            # 自动兜底：找 *_419/susfs_fixed.patch（你的内核通常是 4.19）
-            PATCH_FILE="$(find NonGKI_Kernel_Patches -maxdepth 3 -type f -path "*_419/susfs_fixed.patch" | head -n 1 || true)"
-            if [ -z "$PATCH_FILE" ]; then
-              PATCH_FILE="$(find NonGKI_Kernel_Patches -maxdepth 3 -type f -path "*_419/susfs_155_fixed.patch" | head -n 1 || true)"
-            fi
 
-            if [ -z "$PATCH_FILE" ]; then
-              echo "[ERROR] No usable SusFS patch found for 4.19 layout in ${SUSFS_PATCH_REPO}@${SUSFS_PATCH_BRANCH}"
-              echo "[HINT] Candidates (top 50):"
-              find NonGKI_Kernel_Patches -maxdepth 4 -type f -name 'susfs*_fixed*.patch' | head -n 50 || true
-              exit 1
+          for cand in \
+            "NonGKI_Kernel_Patches/kona_cos15_a15/${FILE}" \
+            "NonGKI_Kernel_Patches/kona_oos/${FILE}" \
+            "NonGKI_Kernel_Patches/kona_cos15_a15/susfs_fixed.patch" \
+            "NonGKI_Kernel_Patches/kona_oos/susfs_fixed.patch" \
+            "NonGKI_Kernel_Patches/kona_cos15_a15/susfs_155_fixed.patch" \
+            "NonGKI_Kernel_Patches/kona_oos/susfs_155_fixed.patch"
+          do
+            if [ -f "$cand" ]; then
+              PATCH_FILE="$cand"
+              break
             fi
+          done
 
-            echo "[WARN] No SUSFS_PATCH_DIR provided. Auto-picked patch: $PATCH_FILE"
-            echo "[HINT] You can pin it via workflow input SUSFS_PATCH_DIR/SUSFS_PATCH_FILE."
+          # 最终兜底：全仓库找一个 susfs_fixed.patch
+          if [ -z "$PATCH_FILE" ]; then
+            PATCH_FILE="$(find NonGKI_Kernel_Patches -maxdepth 4 -type f -name 'susfs_fixed.patch' | head -n 1 || true)"
           fi
 
-          echo "[INFO] Applying patch: $PATCH_FILE"
+          if [ -z "$PATCH_FILE" ]; then
+            echo "[ERROR] Cannot find any susfs_fixed.patch in ${SUSFS_PATCH_REPO}@${SUSFS_PATCH_BRANCH}"
+            echo "[HINT] Candidates (top 50):"
+            find NonGKI_Kernel_Patches -maxdepth 4 -type f -name 'susfs*_fixed*.patch' | head -n 50 || true
+            exit 1
+          fi
+
+          echo "[INFO] Using SusFS patch: $PATCH_FILE"
           patch -p1 < "$PATCH_FILE" || true
 
           if find . -type f -name "*.rej" | grep -q .; then
-            echo "[ERROR] Patch rejected (.rej found). Showing first 200 lines of each rej:"
+            echo "[ERROR] SusFS patch rejected (.rej found). Showing first 200 lines:"
             for r in $(find . -type f -name "*.rej"); do
               echo "----- $r -----"
               sed -n '1,200p' "$r" || true
@@ -247,7 +225,7 @@ jobs:
           echo "[OK] SusFS patch applied."
 
       # ----------------------------
-      # Apply local OnePlus8 4.19 fix patch (cmdline)
+      # Apply your local OnePlus8 4.19 fix patch (cmdline)
       # ----------------------------
       - name: Apply SusFS cmdline fix (OnePlus8 4.19)
         if: ${{ inputs.ENABLE_SUSFS }}
@@ -262,11 +240,10 @@ jobs:
             exit 1
           fi
 
-          # --forward: 已应用则跳过；失败也会产生 .rej
           patch -p1 --forward < "$FIX_PATCH" || true
 
           if find . -type f -name "*.rej" | grep -q .; then
-            echo "[ERROR] Local cmdline fix patch rejected (.rej found). Showing first 200 lines:"
+            echo "[ERROR] Local cmdline fix rejected (.rej found). Showing first 200 lines:"
             for r in $(find . -type f -name "*.rej"); do
               echo "----- $r -----"
               sed -n '1,200p' "$r" || true
@@ -367,10 +344,8 @@ jobs:
           BA_ARGS=(CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-)
           EX_ARGS=(LD=ld.lld LLVM=1 LLVM_IAS=1)
 
-          # 1) defconfig
           make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" vendor/kona-perf_defconfig
 
-          # 2) merge fragments（不存在就跳过）
           FRAGS=()
           for f in \
             arch/arm64/configs/vendor/debugfs.config \
@@ -390,28 +365,25 @@ jobs:
             make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
           fi
 
-          # 2.5) KPM config（如果你启用 KPM 且内核/配置支持）
           if [ "${{ inputs.ENABLE_KPM }}" = "true" ]; then
             if grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config; then
               if grep -q '^# CONFIG_KPM is not set' out/.config; then
                 sed -i 's/^# CONFIG_KPM is not set/CONFIG_KPM=y/' out/.config
-                echo "[INFO] Enabled CONFIG_KPM=y (from #not set)"
+                echo "[INFO] Enabled CONFIG_KPM=y"
               elif grep -q '^CONFIG_KPM=' out/.config; then
                 sed -i 's/^CONFIG_KPM=.*/CONFIG_KPM=y/' out/.config
                 echo "[INFO] Forced CONFIG_KPM=y"
               else
-                echo "[WARN] CONFIG_KPM symbol not found in .config (kernel may not include KPM Kconfig), skip enabling."
+                echo "[WARN] CONFIG_KPM symbol not found in .config; kernel may not include KPM Kconfig."
               fi
             else
-              echo "[WARN] CONFIG_KALLSYMS_ALL=y not enabled; KPM inline may not work."
+              echo "[WARN] CONFIG_KALLSYMS_ALL not enabled; KPM inline may not work."
             fi
             make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
           fi
 
-          # 3) build (tee log)
           make -j"$(nproc --all)" O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" 2>&1 | tee error.log
 
-          # 4) basic verify
           grep -q '^CONFIG_KSU=y' out/.config
           if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
             grep -q '^CONFIG_KSU_SUSFS=y' out/.config
@@ -425,13 +397,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-
           IMAGE_DIR="$GITHUB_WORKSPACE/kernel_workspace/android-kernel/out/arch/arm64/boot"
-          if [ ! -d "$IMAGE_DIR" ]; then
-            echo "[ERROR] Image dir not found: $IMAGE_DIR"
-            exit 1
-          fi
 
           MODE=""
           if [ -f "$IMAGE_DIR/Image.gz-dtb" ]; then
@@ -447,8 +413,8 @@ jobs:
           fi
 
           echo "[INFO] KPM mode: $MODE"
-
           cd "$IMAGE_DIR"
+
           curl -fLsS -o patch "${KPM_PATCH_URL}"
           chmod +x patch
 
@@ -460,15 +426,12 @@ jobs:
               elif ls "$IMAGE_DIR/dts/vendor/qcom/"*.dtb 1>/dev/null 2>&1; then
                 DTB_DIR="$IMAGE_DIR/dts/vendor/qcom"
               fi
-              if [ -z "$DTB_DIR" ]; then
-                echo "[WARN] DTB dir not found; will still patch Image, but cannot re-pack Image.gz-dtb."
-              fi
 
               rm -f Image.gz-dtb Image.gz || true
               ./patch || true
 
               if [ ! -f oImage ]; then
-                echo "[ERROR] KPM patch did not produce oImage. Check patch tool compatibility."
+                echo "[ERROR] KPM patch did not produce oImage."
                 exit 1
               fi
 
@@ -524,7 +487,6 @@ jobs:
             exit 1
           fi
 
-      # 失败/成功都上传关键产物 + 日志 + rej
       - name: Upload debug artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
@@ -581,7 +543,7 @@ jobs:
           path: kernel_workspace/AnyKernel3/*.zip
 
       # ----------------------------
-      # Telegram notify
+      # Telegram notify (NO secrets in if:)
       # ----------------------------
       - name: Send Success to Telegram
         if: success()
