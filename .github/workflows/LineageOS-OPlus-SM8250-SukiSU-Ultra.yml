@@ -116,7 +116,6 @@ jobs:
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace"
-
           git clone --recursive \
             https://github.com/LineageOS/android_kernel_oneplus_sm8250 \
             -b "${{ inputs.LINEAGE_BRANCH }}" \
@@ -145,14 +144,13 @@ jobs:
           echo "SUKISU_VER=$SUKISU_VER" >> "$GITHUB_ENV"
           echo "SUKISU_COMMIT=$SUKISU_COMMIT" >> "$GITHUB_ENV"
 
-          # 你原本的 patch 仍可保留（允许失败）
+          # 允许失败：保留你原来的额外 patch
           bash "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" || true
 
-          # 去掉 -dirty
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
       # ----------------------------
-      # ✅ 注入内核优化扩展
+      # Extensions
       # ----------------------------
       - name: Inject Kernel Extensions
         shell: bash
@@ -172,26 +170,20 @@ jobs:
             fi
           }
 
-          # 1) LSM / Baseband Guard
           if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then
-            echo "Setting up Baseband Guard (LSM)..."
             curl -fLsS https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh | bash
             set_kcfg "CONFIG_BBG" "y" "$CONFIG_FILE"
             sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
           fi
 
-          # 2) NETFILTER (TTL/HL/TPROXY)
           if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then
-            echo "Enabling Netfilter enhancements..."
             set_kcfg "CONFIG_NETFILTER_XT_TARGET_TTL" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_NETFILTER_XT_TARGET_HL" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_NETFILTER_XT_MATCH_HL" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_NETFILTER_XT_MATCH_TPROXY" "y" "$CONFIG_FILE"
           fi
 
-          # 3) BBR + ECN
           if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then
-            echo "Enabling TCP BBR + ECN..."
             set_kcfg "CONFIG_TCP_CONG_BBR" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_DEFAULT_BBR" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_IP_ECN" "y" "$CONFIG_FILE"
@@ -199,7 +191,7 @@ jobs:
           fi
 
       # ----------------------------
-      # 覆盖片段：确保在 oplus.config 后最终生效
+      # Final override fragment (must be merged last)
       # ----------------------------
       - name: Write final config fragment (override)
         shell: bash
@@ -229,9 +221,6 @@ jobs:
             echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> "$FRAG"
           fi
 
-          echo "Override fragment:"
-          cat "$FRAG"
-
       # ----------------------------
       # Build
       # ----------------------------
@@ -259,10 +248,8 @@ jobs:
           if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
             grep -q '^CONFIG_KSU=y' out/.config
             grep -q '^CONFIG_KSU_SUSFS=y' out/.config
-            echo "Verified: CONFIG_KSU=y and CONFIG_KSU_SUSFS=y in out/.config"
           else
             grep -q '^CONFIG_KSU=y' out/.config
-            echo "Verified: CONFIG_KSU=y in out/.config"
           fi
 
       - name: Check kernel output
@@ -272,7 +259,6 @@ jobs:
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel/out"
 
           if [ -f arch/arm64/boot/Image ]; then
-            echo "CHECK_IMAGE=true" >> "$GITHUB_ENV"
             echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> "$GITHUB_ENV"
           else
             echo "Kernel output file is empty"
@@ -315,7 +301,7 @@ jobs:
           path: kernel_workspace/AnyKernel3/*.zip
 
       # ----------------------------
-      # Telegram 通知（不使用 %0A；并避免 if: 使用 secrets）
+      # Telegram notify (NO secrets in if:)
       # ----------------------------
       - name: Send Success to Telegram
         if: success()
@@ -325,7 +311,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           if [ -z "${TELEGRAM_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
             echo "Telegram secrets not set, skipping notify."
             exit 0
@@ -333,14 +318,10 @@ jobs:
 
           cd "$GITHUB_WORKSPACE/kernel_workspace/AnyKernel3"
 
-          SUSFS_STATUS="❌"
-          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then SUSFS_STATUS="✅"; fi
-          LSM_STATUS="❌"
-          if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then LSM_STATUS="✅"; fi
-          NF_STATUS="❌"
-          if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then NF_STATUS="✅"; fi
-          BBR_STATUS="❌"
-          if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then BBR_STATUS="✅"; fi
+          SUSFS_STATUS="❌"; [ "${{ inputs.ENABLE_SUSFS }}" = "true" ] && SUSFS_STATUS="✅"
+          LSM_STATUS="❌";   [ "${{ inputs.ENABLE_LSM }}" = "true" ] && LSM_STATUS="✅"
+          NF_STATUS="❌";    [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ] && NF_STATUS="✅"
+          BBR_STATUS="❌";   [ "${{ inputs.ENABLE_BBR }}" = "true" ] && BBR_STATUS="✅"
 
           CAPTION=$(cat <<EOF
 ✅ Kernel Build Success!
@@ -359,7 +340,6 @@ EOF
 
           curl -sS -F chat_id="$TELEGRAM_CHAT_ID" \
             -F document=@"${{ env.ZIP_NAME }}" \
-            -F parse_mode=Markdown \
             --form-string caption="$CAPTION" \
             "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument"
 
@@ -371,7 +351,6 @@ EOF
         shell: bash
         run: |
           set -euo pipefail
-
           if [ -z "${TELEGRAM_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
             echo "Telegram secrets not set, skipping notify."
             exit 0
