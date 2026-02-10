@@ -8,22 +8,18 @@ jobs:
     runs-on: ubuntu-22.04
 
     env:
-      # ===== 按你自己的仓库改这 3 个 =====
       KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8250.git
       KERNEL_BRANCH: android12
       DEFCONFIG: vendor/kona_defconfig
-      # ===================================
 
       SUKISU_REPO: https://github.com/SukiSU-Ultra/SukiSU-Ultra.git
       SUKISU_BRANCH: main
 
       ARCH: arm64
       SUBARCH: arm64
-      CCACHE_COMPRESS: "1"
-      CCACHE_MAXSIZE: 4G
 
     steps:
-      - name: Checkout this repo (patches + workflow)
+      - name: Checkout this repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -33,15 +29,9 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison build-essential ccache curl flex g++ gcc git gnupg gperf \
-            imagemagick libncurses5-dev libssl-dev libtinfo5 libxml2-utils lz4 \
-            make ninja-build openjdk-11-jdk python3 python3-pip rsync unzip \
-            wget zip zstd
-
-      - name: Prepare ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          max-size: 4G
+            bc bison build-essential ccache curl flex g++ gcc git \
+            libncurses5-dev libssl-dev make ninja-build python3 unzip \
+            rsync zip zstd lz4
 
       - name: Clone kernel source
         run: |
@@ -85,45 +75,29 @@ jobs:
           git apply --verbose "${GITHUB_WORKSPACE}/patches/susfs_cmdline_oneplus8_419.patch"
           git apply --verbose "${GITHUB_WORKSPACE}/patches/susfs_fixups_oneplus8_419.patch"
 
-      - name: Fix KPM access_ok for arm64 4.19 (2-arg -> 3-arg)
+      - name: Fix KPM access_ok for arm64 4.19
         run: |
           set -euo pipefail
           KPM_FILE="${GITHUB_WORKSPACE}/kernel_workspace/android-kernel/drivers/kernelsu/kpm/kpm.c"
           test -f "${KPM_FILE}"
 
-          python3 - <<'PY'
-import re, pathlib
-p = pathlib.Path(r"""${GITHUB_WORKSPACE}/kernel_workspace/android-kernel/drivers/kernelsu/kpm/kpm.c""")
-s = p.read_text(encoding="utf-8", errors="ignore")
+          python3 -c "import re,pathlib; p=pathlib.Path(r'${KPM_FILE}'); s=p.read_text(encoding='utf-8',errors='ignore'); \
+pat=re.compile(r'access_ok\\s*\\(\\s*([^,()]+?)\\s*,\\s*([^)]+?)\\s*\\)'); \
+s2=pat.sub(lambda m: f'access_ok(0, {m.group(1).strip()}, {m.group(2).strip()})', s); \
+p.write_text(s2, encoding='utf-8'); print('patched access_ok calls:', len(pat.findall(s)))"
 
-# 把 access_ok(addr, size) -> access_ok(0, addr, size)
-# 只替换“逗号只有一个”的两参形式，避免误伤三参。
-pattern = re.compile(r'access_ok\s*\(\s*([^,()]+?)\s*,\s*([^)]+?)\s*\)')
-def repl(m):
-    a = m.group(1).strip()
-    b = m.group(2).strip()
-    return f'access_ok(0, {a}, {b})'
-s2 = pattern.sub(repl, s)
-
-p.write_text(s2, encoding="utf-8")
-print("patched access_ok() calls:", len(pattern.findall(s)))
-PY
-
-          # 打印几行确认
           grep -n "access_ok" "${KPM_FILE}" | head -n 50 || true
 
       - name: Configure kernel
         run: |
           set -euo pipefail
-          KDIR="${GITHUB_WORKSPACE}/kernel_workspace/android-kernel"
-          cd "${KDIR}"
+          cd "${GITHUB_WORKSPACE}/kernel_workspace/android-kernel"
           make O=out "${DEFCONFIG}"
 
       - name: Build kernel
         run: |
           set -euo pipefail
-          KDIR="${GITHUB_WORKSPACE}/kernel_workspace/android-kernel"
-          cd "${KDIR}"
+          cd "${GITHUB_WORKSPACE}/kernel_workspace/android-kernel"
           make -j"$(nproc)" O=out
 
       - name: Collect artifacts
@@ -148,4 +122,4 @@ PY
         uses: actions/upload-artifact@v4
         with:
           name: kernel-artifacts
-          path: artifacts/*
+          path: artifacts
