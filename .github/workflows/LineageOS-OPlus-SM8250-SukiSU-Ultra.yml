@@ -43,11 +43,9 @@ env:
   CLANG_VERSION: clang-r547379
   GCC_TAG: android-12.1.0_r27
 
-  # SusFS patch repo（OnePlus 8 参考项目用 op_kernel 分支）
   SUSFS_PATCH_REPO: JackA1ltman/NonGKI_Kernel_Patches
   SUSFS_PATCH_BRANCH: op_kernel
 
-  # KPM patcher
   KPM_PATCH_URL: https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/refs/heads/main/kpm/patch_linux
 
 jobs:
@@ -68,7 +66,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> "$GITHUB_ENV"
           echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> "$GITHUB_ENV"
 
@@ -98,7 +95,6 @@ jobs:
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace"
           mkdir -p clang-aosp
-
           wget -O "${CLANG_VERSION}.tar.gz" \
             "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
           tar -C clang-aosp -zxvf "${CLANG_VERSION}.tar.gz"
@@ -117,7 +113,6 @@ jobs:
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace"
           mkdir -p gcc-64
-
           wget -O gcc-aarch64.tar.gz \
             "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz"
           tar -C gcc-64 -zxvf gcc-aarch64.tar.gz
@@ -162,19 +157,16 @@ jobs:
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
       # ----------------------------
-      # SusFS kernel patch (源码补丁) - 自动选择 oneplus8/cos15
+      # SusFS kernel patch (允许先产生 .rej，后面修复再放行)
       # ----------------------------
-      - name: Patch SusFS (kernel source patch, auto pick oneplus8)
+      - name: Patch SusFS (kernel source patch, allow rejs)
         if: ${{ inputs.ENABLE_SUSFS }}
         shell: bash
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
-          MAJOR="$(awk -F' = ' '/^VERSION =/{print $2}' Makefile)"
-          MINOR="$(awk -F' = ' '/^PATCHLEVEL =/{print $2}' Makefile)"
-          KV="${MAJOR}.${MINOR}"
-          echo "Detected kernel version: ${KV}"
+          echo "Detected kernel version: $(awk -F' = ' '/^VERSION =/{v=$2} /^PATCHLEVEL =/{p=$2} END{print v"."p}' Makefile)"
 
           rm -rf NonGKI_Kernel_Patches
           git clone --depth=1 -b "${SUSFS_PATCH_BRANCH}" "https://github.com/${SUSFS_PATCH_REPO}.git" NonGKI_Kernel_Patches
@@ -202,7 +194,6 @@ jobs:
 
           if [ -z "$PATCH_FILE" ]; then
             echo "[ERROR] Cannot find any susfs_fixed.patch in ${SUSFS_PATCH_REPO}@${SUSFS_PATCH_BRANCH}"
-            echo "[HINT] Candidates (top 50):"
             find NonGKI_Kernel_Patches -maxdepth 4 -type f -name 'susfs*_fixed*.patch' | head -n 50 || true
             exit 1
           fi
@@ -210,19 +201,11 @@ jobs:
           echo "[INFO] Using SusFS patch: $PATCH_FILE"
           patch -p1 < "$PATCH_FILE" || true
 
-          if find . -type f -name "*.rej" | grep -q .; then
-            echo "[ERROR] SusFS patch rejected (.rej found). Showing first 200 lines:"
-            for r in $(find . -type f -name "*.rej"); do
-              echo "----- $r -----"
-              sed -n '1,200p' "$r" || true
-            done
-            exit 1
-          fi
-
-          echo "[OK] SusFS patch applied."
+          echo "[INFO] Current .rej list (if any):"
+          find . -type f -name "*.rej" -maxdepth 6 -print || true
 
       # ----------------------------
-      # Apply local cmdline fix patch (你仓库已存在)
+      # Apply your cmdline fix patch
       # ----------------------------
       - name: Apply SusFS cmdline fix (OnePlus8 4.19)
         if: ${{ inputs.ENABLE_SUSFS }}
@@ -240,32 +223,23 @@ jobs:
           patch -p1 --forward < "$FIX_PATCH" || true
 
           if find . -type f -name "*.rej" | grep -q .; then
-            echo "[ERROR] cmdline fix rejected (.rej found). Showing first 200 lines:"
-            for r in $(find . -type f -name "*.rej"); do
-              echo "----- $r -----"
-              sed -n '1,200p' "$r" || true
-            done
-            exit 1
+            echo "[WARN] .rej exists after cmdline fix (might be from SusFS main patch). Continue."
           fi
 
-          echo "[OK] cmdline fix applied or already applied."
-
       # ----------------------------
-      # FIXUPS: 不用 patch，直接幂等插入（彻底避免 task_mmu/sys.c 再出 .rej）
+      # Fixups: 幂等插入 + 清理这两处对应的 .rej，然后检查是否还有其他 .rej
       # ----------------------------
-      - name: Apply SusFS fixups (task_mmu + uname spoof) idempotent
+      - name: Apply SusFS fixups (task_mmu + uname) and cleanup rejs
         if: ${{ inputs.ENABLE_SUSFS }}
         shell: bash
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
-          echo "==> Fix task_mmu.c: add susfs_def.h include guard"
+          echo "==> Fix task_mmu.c include"
           TM="fs/proc/task_mmu.c"
           if [ -f "$TM" ]; then
-            if grep -q "susfs_def.h" "$TM"; then
-              echo "[INFO] task_mmu.c already includes susfs_def.h, skip."
-            else
+            if ! grep -q "susfs_def.h" "$TM"; then
               awk '
                 BEGIN{ins=0}
                 {print}
@@ -276,8 +250,6 @@ jobs:
                   ins=1
                 }
               ' "$TM" > "$TM.tmp" && mv "$TM.tmp" "$TM"
-
-              # 若没找到 sched/signal.h（不同树可能无此 include），插到 ctype.h 后
               if ! grep -q "susfs_def.h" "$TM"; then
                 awk '
                   BEGIN{ins=0}
@@ -290,21 +262,16 @@ jobs:
                   }
                 ' "$TM" > "$TM.tmp" && mv "$TM.tmp" "$TM"
               fi
-
-              grep -q "susfs_def.h" "$TM" || { echo "[ERROR] task_mmu.c insert failed"; exit 1; }
-              echo "[OK] task_mmu.c fixed."
             fi
+            grep -q "susfs_def.h" "$TM" || { echo "[ERROR] task_mmu.c fix failed"; exit 1; }
           else
             echo "[WARN] $TM not found, skip."
           fi
 
-          echo "==> Fix sys.c: add uname spoof extern + call"
+          echo "==> Fix sys.c uname spoof hook"
           SYS="kernel/sys.c"
           if [ -f "$SYS" ]; then
-            if grep -q "susfs_spoof_uname" "$SYS"; then
-              echo "[INFO] sys.c already has susfs_spoof_uname hook, skip."
-            else
-              # 插 extern：在 SYSCALL_DEFINE1(newuname...) 之前
+            if ! grep -q "susfs_spoof_uname" "$SYS"; then
               awk '
                 BEGIN{added=0}
                 /SYSCALL_DEFINE1\(newuname/ && added==0{
@@ -316,7 +283,6 @@ jobs:
                 {print}
               ' "$SYS" > "$SYS.tmp" && mv "$SYS.tmp" "$SYS"
 
-              # 插调用：在 memcpy(&tmp, ..., sizeof(tmp)); 后
               awk '
                 BEGIN{done=0}
                 {print}
@@ -327,13 +293,26 @@ jobs:
                   done=1
                 }
               ' "$SYS" > "$SYS.tmp" && mv "$SYS.tmp" "$SYS"
-
-              grep -q "susfs_spoof_uname" "$SYS" || { echo "[ERROR] sys.c insert failed"; exit 1; }
-              echo "[OK] sys.c fixed."
             fi
+            grep -q "susfs_spoof_uname" "$SYS" || { echo "[ERROR] sys.c fix failed"; exit 1; }
           else
             echo "[WARN] $SYS not found, skip."
           fi
+
+          echo "==> Cleanup known .rej (task_mmu/sys.c) because we applied them manually"
+          rm -f fs/proc/task_mmu.c.rej kernel/sys.c.rej || true
+
+          echo "==> Remaining .rej check"
+          REMAIN="$(find . -type f -name "*.rej" | wc -l | tr -d ' ')"
+          if [ "$REMAIN" != "0" ]; then
+            echo "[ERROR] Still have .rej files after fixups. Show first 200 lines:"
+            for r in $(find . -type f -name "*.rej"); do
+              echo "----- $r -----"
+              sed -n '1,200p' "$r" || true
+            done
+            exit 1
+          fi
+          echo "[OK] No remaining .rej files."
 
       # ----------------------------
       # Extensions (defconfig tweaks)
@@ -435,10 +414,7 @@ jobs:
             arch/arm64/configs/vendor/sukisu_override.config
           do
             if [ -f "$f" ]; then
-              echo "[INFO] merge fragment: $f"
               FRAGS+=("$f")
-            else
-              echo "[WARN] fragment missing, skip: $f"
             fi
           done
 
@@ -451,15 +427,9 @@ jobs:
             if grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config; then
               if grep -q '^# CONFIG_KPM is not set' out/.config; then
                 sed -i 's/^# CONFIG_KPM is not set/CONFIG_KPM=y/' out/.config
-                echo "[INFO] Enabled CONFIG_KPM=y"
               elif grep -q '^CONFIG_KPM=' out/.config; then
                 sed -i 's/^CONFIG_KPM=.*/CONFIG_KPM=y/' out/.config
-                echo "[INFO] Forced CONFIG_KPM=y"
-              else
-                echo "[WARN] CONFIG_KPM symbol not found in .config; kernel may not include KPM Kconfig."
               fi
-            else
-              echo "[WARN] CONFIG_KALLSYMS_ALL not enabled; KPM inline may not work."
             fi
             make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
           fi
@@ -494,9 +464,7 @@ jobs:
             exit 1
           fi
 
-          echo "[INFO] KPM mode: $MODE"
           cd "$IMAGE_DIR"
-
           curl -fLsS -o patch "${KPM_PATCH_URL}"
           chmod +x patch
 
@@ -512,47 +480,26 @@ jobs:
               rm -f Image.gz-dtb Image.gz || true
               ./patch || true
 
-              if [ ! -f oImage ]; then
-                echo "[ERROR] KPM patch did not produce oImage."
-                exit 1
-              fi
+              [ -f oImage ] || { echo "[ERROR] KPM patch did not produce oImage."; exit 1; }
 
-              rm -f Image
-              mv oImage Image
+              mv -f oImage Image
               gzip -c Image > Image.gz
 
               if [ -n "$DTB_DIR" ]; then
                 cat Image.gz "$DTB_DIR/"*.dtb > Image.gz-dtb
-                echo "[OK] Repacked Image.gz-dtb"
-              else
-                echo "[OK] Patched Image.gz only (no dtb repack)"
               fi
               ;;
             gz)
               rm -f Image.gz || true
               ./patch || true
-
-              if [ ! -f oImage ]; then
-                echo "[ERROR] KPM patch did not produce oImage."
-                exit 1
-              fi
-
-              rm -f Image
-              mv oImage Image
+              [ -f oImage ] || { echo "[ERROR] KPM patch did not produce oImage."; exit 1; }
+              mv -f oImage Image
               gzip -c Image > Image.gz
-              echo "[OK] Repacked Image.gz"
               ;;
             plain)
               ./patch || true
-
-              if [ ! -f oImage ]; then
-                echo "[ERROR] KPM patch did not produce oImage."
-                exit 1
-              fi
-
-              rm -f Image
-              mv oImage Image
-              echo "[OK] Patched Image"
+              [ -f oImage ] || { echo "[ERROR] KPM patch did not produce oImage."; exit 1; }
+              mv -f oImage Image
               ;;
           esac
 
@@ -561,13 +508,8 @@ jobs:
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel/out"
-
-          if [ -f arch/arm64/boot/Image ]; then
-            echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> "$GITHUB_ENV"
-          else
-            echo "Kernel output file is empty"
-            exit 1
-          fi
+          [ -f arch/arm64/boot/Image ] || { echo "Kernel output file is empty"; exit 1; }
+          echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> "$GITHUB_ENV"
 
       - name: Upload debug artifacts (always)
         if: always()
@@ -600,19 +542,13 @@ jobs:
           sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' AnyKernel3/anykernel.sh
 
           rm -rf AnyKernel3/.git* AnyKernel3/README.md
-
           cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
           cd AnyKernel3
 
           SUS_TAG=""
-          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
-            SUS_TAG="-SusFS"
-          fi
-
+          [ "${{ inputs.ENABLE_SUSFS }}" = "true" ] && SUS_TAG="-SusFS"
           KPM_TAG=""
-          if [ "${{ inputs.ENABLE_KPM }}" = "true" ]; then
-            KPM_TAG="-KPM"
-          fi
+          [ "${{ inputs.ENABLE_KPM }}" = "true" ] && KPM_TAG="-KPM"
 
           ZIP="AK3-${{ inputs.LINEAGE_BRANCH }}-OPlus-SM8250-SukiSU${SUS_TAG}${KPM_TAG}_${{ env.SUKISU_VER }}_${{ env.SUKISU_COMMIT }}.zip"
           zip -r "$ZIP" ./*
@@ -641,16 +577,12 @@ jobs:
           fi
 
           cd "$GITHUB_WORKSPACE/kernel_workspace/AnyKernel3"
-
           SUSFS_STATUS="❌"; [ "${{ inputs.ENABLE_SUSFS }}" = "true" ] && SUSFS_STATUS="✅"
           KPM_STATUS="❌";   [ "${{ inputs.ENABLE_KPM }}" = "true" ] && KPM_STATUS="✅"
-          LSM_STATUS="❌";   [ "${{ inputs.ENABLE_LSM }}" = "true" ] && LSM_STATUS="✅"
-          NF_STATUS="❌";    [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ] && NF_STATUS="✅"
-          BBR_STATUS="❌";   [ "${{ inputs.ENABLE_BBR }}" = "true" ] && BBR_STATUS="✅"
 
-          CAPTION="$(printf "✅ Kernel Build Success!\n\nBranch: %s\nKernel Version: %s\nSukiSU Ref: %s\nSukiSU Ver: %s (%s)\n\nSusFS: %s\nKPM: %s\nLSM/BBG: %s\nNetfilter: %s\nBBR+ECN: %s\n" \
+          CAPTION="$(printf "✅ Kernel Build Success!\n\nBranch: %s\nKernel Version: %s\nSukiSU Ref: %s\nSukiSU Ver: %s (%s)\n\nSusFS: %s\nKPM: %s\n" \
             "${{ inputs.LINEAGE_BRANCH }}" "${{ env.KERNEL_VERSION }}" "${{ env.SUKISU_REF }}" "${{ env.SUKISU_VER }}" "${{ env.SUKISU_COMMIT }}" \
-            "${SUSFS_STATUS}" "${KPM_STATUS}" "${LSM_STATUS}" "${NF_STATUS}" "${BBR_STATUS}")"
+            "${SUSFS_STATUS}" "${KPM_STATUS}")"
 
           curl -sS -F chat_id="$TELEGRAM_CHAT_ID" \
             -F document=@"${{ env.ZIP_NAME }}" \
