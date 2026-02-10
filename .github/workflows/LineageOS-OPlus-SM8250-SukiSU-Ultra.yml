@@ -222,7 +222,7 @@ jobs:
           echo "[OK] SusFS patch applied."
 
       # ----------------------------
-      # Apply local fixes (cmdline + fixups patch files)
+      # Apply local cmdline fix patch (你仓库已存在)
       # ----------------------------
       - name: Apply SusFS cmdline fix (OnePlus8 4.19)
         if: ${{ inputs.ENABLE_SUSFS }}
@@ -250,31 +250,90 @@ jobs:
 
           echo "[OK] cmdline fix applied or already applied."
 
-      - name: Apply SusFS fixups patch (task_mmu + uname spoof)
+      # ----------------------------
+      # FIXUPS: 不用 patch，直接幂等插入（彻底避免 task_mmu/sys.c 再出 .rej）
+      # ----------------------------
+      - name: Apply SusFS fixups (task_mmu + uname spoof) idempotent
         if: ${{ inputs.ENABLE_SUSFS }}
         shell: bash
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
-          FIX_PATCH="$GITHUB_WORKSPACE/patches/susfs_fixups_oneplus8_419.patch"
-          if [ ! -f "$FIX_PATCH" ]; then
-            echo "[ERROR] Fix patch not found: $FIX_PATCH"
-            exit 1
+          echo "==> Fix task_mmu.c: add susfs_def.h include guard"
+          TM="fs/proc/task_mmu.c"
+          if [ -f "$TM" ]; then
+            if grep -q "susfs_def.h" "$TM"; then
+              echo "[INFO] task_mmu.c already includes susfs_def.h, skip."
+            else
+              awk '
+                BEGIN{ins=0}
+                {print}
+                $0=="#include <linux/sched/signal.h>" && ins==0{
+                  print "#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP)"
+                  print "#include <linux/susfs_def.h>"
+                  print "#endif"
+                  ins=1
+                }
+              ' "$TM" > "$TM.tmp" && mv "$TM.tmp" "$TM"
+
+              # 若没找到 sched/signal.h（不同树可能无此 include），插到 ctype.h 后
+              if ! grep -q "susfs_def.h" "$TM"; then
+                awk '
+                  BEGIN{ins=0}
+                  {print}
+                  $0=="#include <linux/ctype.h>" && ins==0{
+                    print "#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP)"
+                    print "#include <linux/susfs_def.h>"
+                    print "#endif"
+                    ins=1
+                  }
+                ' "$TM" > "$TM.tmp" && mv "$TM.tmp" "$TM"
+              fi
+
+              grep -q "susfs_def.h" "$TM" || { echo "[ERROR] task_mmu.c insert failed"; exit 1; }
+              echo "[OK] task_mmu.c fixed."
+            fi
+          else
+            echo "[WARN] $TM not found, skip."
           fi
 
-          patch -p1 --forward < "$FIX_PATCH" || true
+          echo "==> Fix sys.c: add uname spoof extern + call"
+          SYS="kernel/sys.c"
+          if [ -f "$SYS" ]; then
+            if grep -q "susfs_spoof_uname" "$SYS"; then
+              echo "[INFO] sys.c already has susfs_spoof_uname hook, skip."
+            else
+              # 插 extern：在 SYSCALL_DEFINE1(newuname...) 之前
+              awk '
+                BEGIN{added=0}
+                /SYSCALL_DEFINE1\(newuname/ && added==0{
+                  print "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME"
+                  print "extern void susfs_spoof_uname(struct new_utsname* tmp);"
+                  print "#endif"
+                  added=1
+                }
+                {print}
+              ' "$SYS" > "$SYS.tmp" && mv "$SYS.tmp" "$SYS"
 
-          if find . -type f -name "*.rej" | grep -q .; then
-            echo "[ERROR] fixups patch rejected (.rej found). Showing first 200 lines:"
-            for r in $(find . -type f -name "*.rej"); do
-              echo "----- $r -----"
-              sed -n '1,200p' "$r" || true
-            done
-            exit 1
+              # 插调用：在 memcpy(&tmp, ..., sizeof(tmp)); 后
+              awk '
+                BEGIN{done=0}
+                {print}
+                done==0 && $0 ~ /memcpy\(&tmp,.*sizeof\(tmp\)\);/{
+                  print "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME"
+                  print "\tsusfs_spoof_uname(&tmp);"
+                  print "#endif"
+                  done=1
+                }
+              ' "$SYS" > "$SYS.tmp" && mv "$SYS.tmp" "$SYS"
+
+              grep -q "susfs_spoof_uname" "$SYS" || { echo "[ERROR] sys.c insert failed"; exit 1; }
+              echo "[OK] sys.c fixed."
+            fi
+          else
+            echo "[WARN] $SYS not found, skip."
           fi
-
-          echo "[OK] fixups patch applied or already applied."
 
       # ----------------------------
       # Extensions (defconfig tweaks)
