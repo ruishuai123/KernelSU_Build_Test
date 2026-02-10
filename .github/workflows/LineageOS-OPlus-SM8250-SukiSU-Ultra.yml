@@ -66,8 +66,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> "$GITHUB_ENV"
-          echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> "$GITHUB_ENV"
+
+          echo "BUILD_TIME=$(TZ=Asia/Shanghai date +%y%m%d)" >> "$GITHUB_ENV"
+          echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
 
           sudo apt-get update
           sudo apt-get install -y \
@@ -89,7 +90,7 @@ jobs:
           key: ${{ env.CLANG_VERSION }}
 
       - name: Download & extract Clang-aosp (if cache miss)
-        if: steps.cache-clang.outputs.cache-hit != 'true'
+        if: ${{ steps.cache-clang.outputs.cache-hit != 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -107,7 +108,7 @@ jobs:
           key: gcc-aarch64-${{ env.GCC_TAG }}
 
       - name: Download & extract Gcc-aosp (if cache miss)
-        if: steps.cache-gcc.outputs.cache-hit != 'true'
+        if: ${{ steps.cache-gcc.outputs.cache-hit != 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -160,7 +161,7 @@ jobs:
       # SusFS kernel patch (允许先产生 .rej，后面修复再放行)
       # ----------------------------
       - name: Patch SusFS (kernel source patch, allow rejs)
-        if: ${{ inputs.ENABLE_SUSFS }}
+        if: ${{ inputs.ENABLE_SUSFS == true }}
         shell: bash
         run: |
           set -euo pipefail
@@ -202,13 +203,13 @@ jobs:
           patch -p1 < "$PATCH_FILE" || true
 
           echo "[INFO] Current .rej list (if any):"
-          find . -type f -name "*.rej" -maxdepth 6 -print || true
+          find . -maxdepth 6 -type f -name "*.rej" -print || true
 
       # ----------------------------
       # Apply your cmdline fix patch
       # ----------------------------
       - name: Apply SusFS cmdline fix (OnePlus8 4.19)
-        if: ${{ inputs.ENABLE_SUSFS }}
+        if: ${{ inputs.ENABLE_SUSFS == true }}
         shell: bash
         run: |
           set -euo pipefail
@@ -230,7 +231,7 @@ jobs:
       # Fixups: 幂等插入 + 清理这两处对应的 .rej，然后检查是否还有其他 .rej
       # ----------------------------
       - name: Apply SusFS fixups (task_mmu + uname) and cleanup rejs
-        if: ${{ inputs.ENABLE_SUSFS }}
+        if: ${{ inputs.ENABLE_SUSFS == true }}
         shell: bash
         run: |
           set -euo pipefail
@@ -445,7 +446,7 @@ jobs:
       # KPM Inline Patcher
       # ----------------------------
       - name: KPM Inline Patcher
-        if: ${{ success() && inputs.ENABLE_KPM }}
+        if: ${{ success() && inputs.ENABLE_KPM == true }}
         shell: bash
         run: |
           set -euo pipefail
@@ -512,7 +513,7 @@ jobs:
           echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> "$GITHUB_ENV"
 
       - name: Upload debug artifacts (always)
-        if: always()
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: debug-artifacts
@@ -546,9 +547,9 @@ jobs:
           cd AnyKernel3
 
           SUS_TAG=""
-          [ "${{ inputs.ENABLE_SUSFS }}" = "true" ] && SUS_TAG="-SusFS"
+          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then SUS_TAG="-SusFS"; fi
           KPM_TAG=""
-          [ "${{ inputs.ENABLE_KPM }}" = "true" ] && KPM_TAG="-KPM"
+          if [ "${{ inputs.ENABLE_KPM }}" = "true" ]; then KPM_TAG="-KPM"; fi
 
           ZIP="AK3-${{ inputs.LINEAGE_BRANCH }}-OPlus-SM8250-SukiSU${SUS_TAG}${KPM_TAG}_${{ env.SUKISU_VER }}_${{ env.SUKISU_COMMIT }}.zip"
           zip -r "$ZIP" ./*
@@ -564,7 +565,7 @@ jobs:
       # Telegram notify (NO secrets in if:)
       # ----------------------------
       - name: Send Success to Telegram
-        if: success()
+        if: ${{ success() }}
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -577,10 +578,11 @@ jobs:
           fi
 
           cd "$GITHUB_WORKSPACE/kernel_workspace/AnyKernel3"
-          SUSFS_STATUS="❌"; [ "${{ inputs.ENABLE_SUSFS }}" = "true" ] && SUSFS_STATUS="✅"
-          KPM_STATUS="❌";   [ "${{ inputs.ENABLE_KPM }}" = "true" ] && KPM_STATUS="✅"
+          SUSFS_STATUS="❌"; if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then SUSFS_STATUS="✅"; fi
+          KPM_STATUS="❌";   if [ "${{ inputs.ENABLE_KPM }}" = "true" ]; then KPM_STATUS="✅"; fi
 
-          CAPTION="$(printf "✅ Kernel Build Success!\n\nBranch: %s\nKernel Version: %s\nSukiSU Ref: %s\nSukiSU Ver: %s (%s)\n\nSusFS: %s\nKPM: %s\n" \
+          CAPTION="$(printf '%s\n\nBranch: %s\nKernel Version: %s\nSukiSU Ref: %s\nSukiSU Ver: %s (%s)\n\nSusFS: %s\nKPM: %s\n' \
+            "✅ Kernel Build Success!" \
             "${{ inputs.LINEAGE_BRANCH }}" "${{ env.KERNEL_VERSION }}" "${{ env.SUKISU_REF }}" "${{ env.SUKISU_VER }}" "${{ env.SUKISU_COMMIT }}" \
             "${SUSFS_STATUS}" "${KPM_STATUS}")"
 
@@ -590,7 +592,7 @@ jobs:
             "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument"
 
       - name: Send Failure to Telegram
-        if: failure()
+        if: ${{ failure() }}
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -602,7 +604,8 @@ jobs:
             exit 0
           fi
 
-          MESSAGE="$(printf "❌ Kernel Build Failed!\n\nBranch: %s\nBuild User: %s\n\nLogs: %s/%s/actions/runs/%s\n" \
+          MESSAGE="$(printf '%s\n\nBranch: %s\nBuild User: %s\n\nLogs: %s/%s/actions/runs/%s\n' \
+            "❌ Kernel Build Failed!" \
             "${{ inputs.LINEAGE_BRANCH }}" "${{ github.actor }}" "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")"
 
           curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
