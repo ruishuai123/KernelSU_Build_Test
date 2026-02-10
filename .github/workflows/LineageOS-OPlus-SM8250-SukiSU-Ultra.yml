@@ -63,7 +63,8 @@ jobs:
           sudo apt-get install -y \
             git ccache automake flex lzop bison gperf build-essential zip curl \
             zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools \
-            dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev wget
+            dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev wget \
+            libelf-dev dwarves
 
           mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
 
@@ -237,14 +238,28 @@ jobs:
           export KBUILD_BUILD_HOST=Github-Action
           export KBUILD_BUILD_USER="$(echo "${{ github.actor }}" | tr A-Z a-z)"
 
-          BA_CMD="CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-"
-          EX_CMD="LD=ld.lld LLVM=1 LLVM_IAS=1"
+          # 用数组避免空格展开/引用问题
+          BA_ARGS=(CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-)
+          EX_ARGS=(LD=ld.lld LLVM=1 LLVM_IAS=1)
 
-          DEFCONFIG="vendor/kona-perf_defconfig vendor/debugfs.config vendor/oplus.config vendor/sukisu_override.config"
+          # 1) 先生成基础 defconfig
+          make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" vendor/kona-perf_defconfig
 
-          make O=out CC=clang $BA_CMD $EX_CMD $DEFCONFIG
-          make -j"$(nproc --all)" O=out CC=clang $BA_CMD $EX_CMD
+          # 2) 合并 fragment（这些是 config 片段，不是 make target）
+          FRAGS=(
+            arch/arm64/configs/vendor/debugfs.config
+            arch/arm64/configs/vendor/oplus.config
+            arch/arm64/configs/vendor/sukisu_override.config
+          )
+          bash scripts/kconfig/merge_config.sh -m -O out out/.config "${FRAGS[@]}"
 
+          # 3) 补齐依赖
+          make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
+
+          # 4) 编译
+          make -j"$(nproc --all)" O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}"
+
+          # 5) 断言配置生效
           if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
             grep -q '^CONFIG_KSU=y' out/.config
             grep -q '^CONFIG_KSU_SUSFS=y' out/.config
