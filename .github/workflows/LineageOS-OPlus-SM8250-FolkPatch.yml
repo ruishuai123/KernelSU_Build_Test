@@ -1,4 +1,4 @@
-name: Build LineageOS Kernel (Optimized Only)
+name: Build LineageOS Kernel (Optimized + FolkPatch)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         default: "lineage-23.2"
 
-      # ✅ 优化功能开关 (已移除 ZRAM / KernelSU / SusFS)
+      # ✅ 优化功能开关
       ENABLE_NETFILTER:
         description: "启用 NETFILTER (TTL/HL/TPROXY)"
         required: true
@@ -23,6 +23,13 @@ on:
 
       ENABLE_LSM:
         description: "启用 LSM / BBG (基带保护)"
+        required: true
+        type: boolean
+        default: true
+
+      # ✅ 新增：KernelPatch 开关
+      ENABLE_KP:
+        description: "启用 KernelPatch (FolkPatch)"
         required: true
         type: boolean
         default: true
@@ -114,7 +121,7 @@ jobs:
             android-kernel --depth=1
 
       # ----------------------------
-      # ✅ 注入内核优化扩展 (FQ + 你原有三项优化)
+      # ✅ 注入内核优化扩展
       # ----------------------------
       - name: Inject Kernel Extensions
         run: |
@@ -145,8 +152,6 @@ jobs:
             curl -fLsS https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh | bash
 
             set_kcfg "CONFIG_BBG" "y" "$CONFIG_FILE"
-
-            # 将 baseband_guard 加入 security/Kconfig 的默认 LSM 列表（若已存在则不重复加）
             sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
           fi
 
@@ -159,7 +164,7 @@ jobs:
             set_kcfg "CONFIG_NETFILTER_XT_MATCH_TPROXY" "y" "$CONFIG_FILE"
           fi
 
-          # ---- 4) BBR + ECN（并建议配套 FQ）
+          # ---- 4) BBR + ECN
           if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then
             echo "🚀 Enabling TCP BBR + ECN..."
             set_kcfg "CONFIG_TCP_CONG_BBR" "y" "$CONFIG_FILE"
@@ -207,6 +212,38 @@ jobs:
           fi
 
       # ----------------------------
+      # ✅ 注入 KernelPatch (FolkPatch)
+      # ----------------------------
+      - name: Patch Kernel with KernelPatch
+        if: inputs.ENABLE_KP == true
+        env:
+          KP_SUPERKEY: ${{ secrets.KP_SUPERKEY }}
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel/out/arch/arm64/boot"
+          
+          if [[ -z "${KP_SUPERKEY}" ]]; then
+             echo "❌ Error: KP_SUPERKEY secret is not set!"
+             exit 1
+          fi
+
+          echo "⬇️ Downloading KernelPatch tools..."
+          # 如果你有特定的 FolkPatch 下载源，请修改下面的 URL
+          wget -O kptools-linux https://github.com/bmax121/KernelPatch/releases/latest/download/kptools-linux
+          wget -O kpimg-android https://github.com/bmax121/KernelPatch/releases/latest/download/kpimg-android
+          
+          chmod +x kptools-linux
+
+          echo "🔧 Patching Kernel Image..."
+          # 备份原始内核
+          cp Image Image.backup
+          
+          # 执行修补: 输入 Image.backup -> 输出 Image
+          ./kptools-linux -p --image Image.backup --skey "${KP_SUPERKEY}" --kpimg kpimg-android --out Image
+
+          echo "✅ KernelPatch applied successfully."
+
+      # ----------------------------
       # Package (AnyKernel3)
       # ----------------------------
       - name: Prepare AnyKernel3 and package
@@ -235,7 +272,7 @@ jobs:
           path: kernel_workspace/AnyKernel3/*.zip
 
       # ----------------------------
-      # ✅ Telegram 通知（已去掉 %0A 编码）
+      # ✅ Telegram 通知
       # ----------------------------
       - name: Send Success to Telegram
         if: success()
@@ -250,6 +287,7 @@ jobs:
           CAPTION+=$'🔸 *Branch:* ${{ inputs.LINEAGE_BRANCH }}\\n'
           CAPTION+=$'🔸 *Kernel Version:* ${{ env.KERNEL_VERSION }}\\n\\n'
 
+          if [ "${{ inputs.ENABLE_KP }}" = "true" ]; then CAPTION+=$'🔹 *KernelPatch:* ✅\\n'; else CAPTION+=$'🔹 *KernelPatch:* ❌\\n'; fi
           if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then CAPTION+=$'🔹 *LSM/BBG:* ✅\\n'; else CAPTION+=$'🔹 *LSM/BBG:* ❌\\n'; fi
           if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then CAPTION+=$'🔹 *Netfilter:* ✅\\n'; else CAPTION+=$'🔹 *Netfilter:* ❌\\n'; fi
           if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then CAPTION+=$'🔹 *BBR+ECN:* ✅\\n'; else CAPTION+=$'🔹 *BBR+ECN:* ❌\\n'; fi
