@@ -137,7 +137,7 @@ jobs:
         path: kernel_workspace/AnyKernel3/*.zip
 
     - name: Send to Telegram Bot
-      if: success() && secrets.TELEGRAM_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != ''
+      if: success()
       env:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }} # 注意这里改成了 CHAT_ID
