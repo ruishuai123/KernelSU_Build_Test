@@ -114,7 +114,7 @@ jobs:
             android-kernel --depth=1
 
       # ----------------------------
-      # ✅ 注入内核优化扩展 (FQ + 清理 debug/trace + 你原有三项优化)
+      # ✅ 注入内核优化扩展 (FQ + 你原有三项优化)
       # ----------------------------
       - name: Inject Kernel Extensions
         run: |
@@ -132,42 +132,6 @@ jobs:
               echo "${key}=${val}" >> "$file"
             fi
           }
-
-          # ---- 0) 清理 Debug / Trace（常见项：关掉即可，没该 Kconfig 也不影响）
-          echo "🧹 Disabling debug/trace configs..."
-          set_kcfg "CONFIG_DEBUG_KERNEL" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_DEBUG_INFO" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_DEBUG_INFO_DWARF4" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_DEBUG_INFO_BTF" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_GDB_SCRIPTS" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_KGDB" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_KGDB_KDB" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_MAGIC_SYSRQ" "n" "$CONFIG_FILE"
-
-          set_kcfg "CONFIG_TRACING" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_FTRACE" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_FUNCTION_TRACER" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_FUNCTION_GRAPH_TRACER" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_IRQSOFF_TRACER" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_PREEMPT_TRACER" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_SCHED_TRACER" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_HWLAT_TRACER" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_OSNOISE_TRACER" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_TIMERLAT_TRACER" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_EVENT_TRACING" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_CONTEXT_SWITCH_TRACER" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_RING_BUFFER_ALLOW_SWAP" "n" "$CONFIG_FILE"
-
-          set_kcfg "CONFIG_LOCKDEP" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_PROVE_LOCKING" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_DEBUG_SPINLOCK" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_DEBUG_MUTEXES" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_DEBUG_LIST" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_DEBUG_ATOMIC_SLEEP" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_DEBUG_MEMORY_INIT" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_DEBUG_PREEMPT" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_SCHEDSTATS" "n" "$CONFIG_FILE"
-          set_kcfg "CONFIG_LATENCYTOP" "n" "$CONFIG_FILE"
 
           # ---- 1) 开启 FQ qdisc + 设为默认
           echo "🌊 Enabling FQ qdisc and set as default..."
@@ -282,13 +246,13 @@ jobs:
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/AnyKernel3"
 
-          CAPTION=$'✅ *Kernel Build Success!*\n\n'
-          CAPTION+=$'🔸 *Branch:* ${{ inputs.LINEAGE_BRANCH }}\n'
-          CAPTION+=$'🔸 *Kernel Version:* ${{ env.KERNEL_VERSION }}\n\n'
+          CAPTION=$'✅ *Kernel Build Success!*\\n\\n'
+          CAPTION+=$'🔸 *Branch:* ${{ inputs.LINEAGE_BRANCH }}\\n'
+          CAPTION+=$'🔸 *Kernel Version:* ${{ env.KERNEL_VERSION }}\\n\\n'
 
-          if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then CAPTION+=$'🔹 *LSM/BBG:* ✅\n'; else CAPTION+=$'🔹 *LSM/BBG:* ❌\n'; fi
-          if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then CAPTION+=$'🔹 *Netfilter:* ✅\n'; else CAPTION+=$'🔹 *Netfilter:* ❌\n'; fi
-          if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then CAPTION+=$'🔹 *BBR+ECN:* ✅\n'; else CAPTION+=$'🔹 *BBR+ECN:* ❌\n'; fi
+          if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then CAPTION+=$'🔹 *LSM/BBG:* ✅\\n'; else CAPTION+=$'🔹 *LSM/BBG:* ❌\\n'; fi
+          if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then CAPTION+=$'🔹 *Netfilter:* ✅\\n'; else CAPTION+=$'🔹 *Netfilter:* ❌\\n'; fi
+          if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then CAPTION+=$'🔹 *BBR+ECN:* ✅\\n'; else CAPTION+=$'🔹 *BBR+ECN:* ❌\\n'; fi
 
           curl -fLsS -F chat_id="$TELEGRAM_CHAT_ID" \
             -F document=@"${{ env.ZIP_NAME }}" \
@@ -303,9 +267,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euxo pipefail
-          MESSAGE=$'❌ *Kernel Build Failed!*\n\n'
-          MESSAGE+=$'🔸 *Branch:* ${{ inputs.LINEAGE_BRANCH }}\n'
-          MESSAGE+=$'🔸 *Build User:* ${{ github.actor }}\n\n'
+          MESSAGE=$'❌ *Kernel Build Failed!*\\n\\n'
+          MESSAGE+=$'🔸 *Branch:* ${{ inputs.LINEAGE_BRANCH }}\\n'
+          MESSAGE+=$'🔸 *Build User:* ${{ github.actor }}\\n\\n'
           MESSAGE+=$'📋 *Logs:* [View Action Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})'
 
           curl -fLsS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
