@@ -80,6 +80,31 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
 
       # ----------------------------
+      # ccache
+      # ----------------------------
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/kernel_workspace/.ccache
+          key: ccache-${{ runner.os }}-${{ inputs.LINEAGE_BRANCH }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ inputs.LINEAGE_BRANCH }}-
+            ccache-${{ runner.os }}-
+
+      - name: Configure ccache
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/kernel_workspace/.ccache"
+          {
+            echo "CCACHE_DIR=$GITHUB_WORKSPACE/kernel_workspace/.ccache"
+            echo "CCACHE_COMPILERCHECK=content"
+            echo "CCACHE_MAXSIZE=8G"
+          } >> "$GITHUB_ENV"
+          ccache -M 8G || true
+          ccache -z || true
+
+      # ----------------------------
       # Toolchains
       # ----------------------------
       - name: Cache Clang toolchain
@@ -87,7 +112,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/kernel_workspace/clang-aosp
-          key: ${{ env.CLANG_VERSION }}
+          key: clang-${{ runner.os }}-${{ env.CLANG_VERSION }}
 
       - name: Download & extract Clang-aosp (if cache miss)
         if: ${{ steps.cache-clang.outputs.cache-hit != 'true' }}
@@ -105,7 +130,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/kernel_workspace/gcc-64
-          key: gcc-aarch64-${{ env.GCC_TAG }}
+          key: gcc-aarch64-${{ runner.os }}-${{ env.GCC_TAG }}
 
       - name: Download & extract Gcc-aosp (aarch64) (if cache miss)
         if: ${{ steps.cache-gcc-64.outputs.cache-hit != 'true' }}
@@ -118,13 +143,12 @@ jobs:
             "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz"
           tar -C gcc-64 -zxvf gcc-aarch64.tar.gz
 
-      # ✅ 关键：补齐 arm(32-bit) GCC 4.9（很多 4.19 树需要）
       - name: Cache GCC toolchain (arm32)
         id: cache-gcc-32
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/kernel_workspace/gcc-32
-          key: gcc-arm-${{ env.GCC_TAG }}
+          key: gcc-arm-${{ runner.os }}-${{ env.GCC_TAG }}
 
       - name: Download & extract Gcc-aosp (arm32) (if cache miss)
         if: ${{ steps.cache-gcc-32.outputs.cache-hit != 'true' }}
@@ -177,10 +201,151 @@ jobs:
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
       # ----------------------------
+      # ✅ Patch drivers/kernelsu/ksu.c (你给的基础上完善：更稳的 init/exit 清理 + 头文件补齐)
+      # ----------------------------
+      - name: Patch KernelSU ksu.c (improved init/exit safety)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+
+          KSU_FILE="drivers/kernelsu/ksu.c"
+          if [ ! -f "$KSU_FILE" ]; then
+            echo "[ERROR] $KSU_FILE not found."
+            find drivers -maxdepth 5 -type f -name "ksu.c" -print || true
+            exit 1
+          fi
+
+          cat > "$KSU_FILE" <<'EOF'
+          // SPDX-License-Identifier: GPL-2.0-only
+          #include <linux/cred.h>
+          #include <linux/export.h>
+          #include <linux/fs.h>
+          #include <linux/kobject.h>
+          #include <linux/module.h>
+          #include <linux/workqueue.h>
+
+          #include "allowlist.h"
+          #include "feature.h"
+          #include "klog.h" // IWYU pragma: keep
+          #include "throne_tracker.h"
+          #include "syscall_hook_manager.h"
+          #include "ksud.h"
+          #include "supercalls.h"
+          #include "ksu.h"
+          #include "file_wrapper.h"
+
+          struct cred *ksu_cred;
+
+          void sukisu_custom_config_init(void)
+          {
+          }
+
+          void sukisu_custom_config_exit(void)
+          {
+          }
+
+          static void ksu_cleanup_all(void)
+          {
+              /* 逆序清理，确保依赖关系更安全 */
+              ksu_file_wrapper_exit();
+              ksu_ksud_exit();
+              ksu_throne_tracker_exit();
+              ksu_allowlist_exit();
+              ksu_syscall_hook_manager_exit();
+              sukisu_custom_config_exit();
+              ksu_supercalls_exit();
+              ksu_feature_exit();
+
+              if (ksu_cred) {
+                  put_cred(ksu_cred);
+                  ksu_cred = NULL;
+              }
+          }
+
+          int __init kernelsu_init(void)
+          {
+          #ifdef CONFIG_KSU_DEBUG
+              pr_alert("*************************************************************\n");
+              pr_alert("**     NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE    **\n");
+              pr_alert("**                                                         **\n");
+              pr_alert("**         You are running KernelSU in DEBUG mode          **\n");
+              pr_alert("**                                                         **\n");
+              pr_alert("**     NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE    **\n");
+              pr_alert("*************************************************************\n");
+          #endif
+
+              ksu_cred = prepare_creds();
+              if (!ksu_cred) {
+                  pr_err("KernelSU: prepare_creds failed!\n");
+                  return -ENOMEM;
+              }
+
+              /*
+               * 初始化顺序保持与你原来的逻辑一致；
+               * 但如果后续某个 init 未来改成可能失败，可直接 goto fail 统一清理。
+               */
+              ksu_feature_init();
+              ksu_supercalls_init();
+              sukisu_custom_config_init();
+              ksu_syscall_hook_manager_init();
+              ksu_allowlist_init();
+              ksu_throne_tracker_init();
+              ksu_ksud_init();
+              ksu_file_wrapper_init();
+
+          #ifdef MODULE
+          #ifndef CONFIG_KSU_DEBUG
+              kobject_del(&THIS_MODULE->mkobj.kobj);
+          #endif
+          #endif
+              return 0;
+
+          fail:
+              ksu_cleanup_all();
+              return -EINVAL;
+          }
+
+          extern void ksu_observer_exit(void);
+
+          void __exit kernelsu_exit(void)
+          {
+              /* 与你原逻辑一致，但更统一/更安全 */
+              ksu_allowlist_exit();
+              ksu_throne_tracker_exit();
+              ksu_observer_exit();
+              ksu_ksud_exit();
+              ksu_syscall_hook_manager_exit();
+              sukisu_custom_config_exit();
+              ksu_supercalls_exit();
+              ksu_feature_exit();
+
+              if (ksu_cred) {
+                  put_cred(ksu_cred);
+                  ksu_cred = NULL;
+              }
+          }
+
+          module_init(kernelsu_init);
+          module_exit(kernelsu_exit);
+
+          MODULE_LICENSE("GPL");
+          MODULE_AUTHOR("weishu");
+          MODULE_DESCRIPTION("Android KernelSU");
+          #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+          MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+          #else
+          MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+          #endif
+          EOF
+
+          echo "[OK] Patched $KSU_FILE"
+
+      # ----------------------------
       # ✅ Fix KPM for 4.19: access_ok() signature compatibility
       # ----------------------------
       - name: Patch KPM (kpm.c) for kernel 4.19 access_ok()
-        if: ${{ inputs.ENABLE_KPM == true }}
+        if: ${{ inputs.ENABLE_KPM }}
         shell: bash
         run: |
           set -euo pipefail
@@ -196,16 +361,6 @@ jobs:
 
           cat > "$KPM_FILE" <<'EOF'
           /* SPDX-License-Identifier: GPL-2.0-or-later */
-          /*
-           * Copyright (C) 2025 Liankong (xhsw.new@outlook.com). All Rights Reserved.
-           * 本代码由GPL-2授权
-           *
-           * 适配KernelSU的KPM 内核模块加载器兼容实现
-           *
-           * 集成了 ELF 解析、内存布局、符号处理、重定位（支持 ARM64 重定位类型）
-           * 并参照KernelPatch的标准KPM格式实现加载和控制
-           */
-
           #include <linux/kernel.h>
           #include <linux/fs.h>
           #include <linux/kernfs.h>
@@ -248,11 +403,6 @@ jobs:
           #endif
           #endif
 
-          /*
-           * access_ok() compatibility:
-           *  - kernel < 5.0 usually: access_ok(type, addr, size)
-           *  - kernel >= 5.0 usually: access_ok(addr, size)
-           */
           static __always_inline bool kpm_access_ok_read(unsigned long uaddr, size_t size)
           {
           #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
@@ -275,21 +425,16 @@ jobs:
                                                                 const char *args,
                                                                 void *ptr, int *result)
           {
-              pr_info("kpm: Stub function called (sukisu_kpm_load_module_path). "
-                      "path=%s args=%s ptr=%p\n",
+              pr_info("kpm: Stub function called (sukisu_kpm_load_module_path). path=%s args=%s ptr=%p\n",
                       path, args, ptr);
-
               __asm__ volatile("nop");
           }
           EXPORT_SYMBOL(sukisu_kpm_load_module_path);
 
-          noinline NO_OPTIMIZE void sukisu_kpm_unload_module(const char *name, void *ptr,
-                                                             int *result)
+          noinline NO_OPTIMIZE void sukisu_kpm_unload_module(const char *name, void *ptr, int *result)
           {
-              pr_info("kpm: Stub function called (sukisu_kpm_unload_module). "
-                      "name=%s ptr=%p\n",
+              pr_info("kpm: Stub function called (sukisu_kpm_unload_module). name=%s ptr=%p\n",
                       name, ptr);
-
               __asm__ volatile("nop");
           }
           EXPORT_SYMBOL(sukisu_kpm_unload_module);
@@ -297,47 +442,34 @@ jobs:
           noinline NO_OPTIMIZE void sukisu_kpm_num(int *result)
           {
               pr_info("kpm: Stub function called (sukisu_kpm_num).\n");
-
               __asm__ volatile("nop");
           }
           EXPORT_SYMBOL(sukisu_kpm_num);
 
-          noinline NO_OPTIMIZE void sukisu_kpm_info(const char *name, char *buf,
-                                                    int bufferSize, int *size)
+          noinline NO_OPTIMIZE void sukisu_kpm_info(const char *name, char *buf, int bufferSize, int *size)
           {
-              pr_info("kpm: Stub function called (sukisu_kpm_info). "
-                      "name=%s buffer=%p\n",
-                      name, buf);
-
+              pr_info("kpm: Stub function called (sukisu_kpm_info). name=%s buffer=%p\n", name, buf);
               __asm__ volatile("nop");
           }
           EXPORT_SYMBOL(sukisu_kpm_info);
 
-          noinline NO_OPTIMIZE void sukisu_kpm_list(void *out, int bufferSize,
-                                                    int *result)
+          noinline NO_OPTIMIZE void sukisu_kpm_list(void *out, int bufferSize, int *result)
           {
-              pr_info("kpm: Stub function called (sukisu_kpm_list). "
-                      "buffer=%p size=%d\n",
-                      out, bufferSize);
+              pr_info("kpm: Stub function called (sukisu_kpm_list). buffer=%p size=%d\n", out, bufferSize);
           }
           EXPORT_SYMBOL(sukisu_kpm_list);
 
-          noinline NO_OPTIMIZE void sukisu_kpm_control(const char *name, const char *args,
-                                                       long arg_len, int *result)
+          noinline NO_OPTIMIZE void sukisu_kpm_control(const char *name, const char *args, long arg_len, int *result)
           {
-              pr_info("kpm: Stub function called (sukisu_kpm_control). "
-                      "name=%p args=%p arg_len=%ld\n",
+              pr_info("kpm: Stub function called (sukisu_kpm_control). name=%p args=%p arg_len=%ld\n",
                       name, args, arg_len);
-
               __asm__ volatile("nop");
           }
           EXPORT_SYMBOL(sukisu_kpm_control);
 
           noinline NO_OPTIMIZE void sukisu_kpm_version(char *buf, int bufferSize)
           {
-              pr_info("kpm: Stub function called (sukisu_kpm_version). "
-                      "buffer=%p\n",
-                      buf);
+              pr_info("kpm: Stub function called (sukisu_kpm_version). buffer=%p\n", buf);
           }
           EXPORT_SYMBOL(sukisu_kpm_version);
 
@@ -358,23 +490,19 @@ jobs:
                       goto exit;
                   }
 
-                  if (!kpm_access_ok_read(arg1, 255)) {
+                  if (!kpm_access_ok_read(arg1, 255))
                       goto invalid_arg;
-                  }
 
                   strncpy_from_user((char *)&kernel_load_path, (const char __user *)arg1, 255);
 
                   if (arg2 != 0) {
-                      if (!kpm_access_ok_read(arg2, 255)) {
+                      if (!kpm_access_ok_read(arg2, 255))
                           goto invalid_arg;
-                      }
-
                       strncpy_from_user((char *)&kernel_args_buffer, (const char __user *)arg2, 255);
                   }
 
                   sukisu_kpm_load_module_path((const char *)&kernel_load_path,
-                                              (const char *)&kernel_args_buffer, NULL,
-                                              &res);
+                                              (const char *)&kernel_args_buffer, NULL, &res);
 
               } else if (control_code == SUKISU_KPM_UNLOAD) {
                   char kernel_name_buffer[256];
@@ -385,9 +513,8 @@ jobs:
                       goto exit;
                   }
 
-                  if (!kpm_access_ok_read(arg1, sizeof(kernel_name_buffer))) {
+                  if (!kpm_access_ok_read(arg1, sizeof(kernel_name_buffer)))
                       goto invalid_arg;
-                  }
 
                   strncpy_from_user((char *)&kernel_name_buffer, (const char __user *)arg1,
                                     sizeof(kernel_name_buffer));
@@ -410,25 +537,20 @@ jobs:
                       goto exit;
                   }
 
-                  if (!kpm_access_ok_read(arg1, sizeof(kernel_name_buffer))) {
+                  if (!kpm_access_ok_read(arg1, sizeof(kernel_name_buffer)))
                       goto invalid_arg;
-                  }
 
-                  strncpy_from_user((char *)&kernel_name_buffer,
-                                    (const char __user *)arg1,
+                  strncpy_from_user((char *)&kernel_name_buffer, (const char __user *)arg1,
                                     sizeof(kernel_name_buffer));
 
                   sukisu_kpm_info((const char *)&kernel_name_buffer, (char *)&buf,
                                   sizeof(buf), &size);
 
-                  if (size < 0)
-                      size = 0;
-                  if (size > (int)sizeof(buf))
-                      size = (int)sizeof(buf);
+                  if (size < 0) size = 0;
+                  if (size > (int)sizeof(buf)) size = (int)sizeof(buf);
 
-                  if (!kpm_access_ok_write(arg2, (size_t)size)) {
+                  if (!kpm_access_ok_write(arg2, (size_t)size))
                       goto invalid_arg;
-                  }
 
                   res = copy_to_user((void __user *)arg2, &buf, (size_t)size);
 
@@ -443,10 +565,8 @@ jobs:
                       goto exit;
                   }
 
-                  /* arg1 is user buffer, arg2 is length */
-                  if (!kpm_access_ok_write(arg1, (size_t)len)) {
+                  if (!kpm_access_ok_write(arg1, (size_t)len))
                       goto invalid_arg;
-                  }
 
                   sukisu_kpm_list((char *)&buf, sizeof(buf), &res);
 
@@ -456,33 +576,34 @@ jobs:
                   }
 
                   if (copy_to_user((void __user *)arg1, &buf, (size_t)len) != 0)
-                      pr_info("kpm: Copy to user failed.");
+                      pr_info("kpm: Copy to user failed.\n");
 
               } else if (control_code == SUKISU_KPM_CONTROL) {
                   char kpm_name[KPM_NAME_LEN] = { 0 };
                   char kpm_args[KPM_ARGS_LEN] = { 0 };
 
-                  if (!kpm_access_ok_read(arg1, sizeof(kpm_name))) {
+                  if (!kpm_access_ok_read(arg1, sizeof(kpm_name)))
                       goto invalid_arg;
-                  }
 
-                  if (!kpm_access_ok_read(arg2, sizeof(kpm_args))) {
+                  if (!kpm_access_ok_read(arg2, sizeof(kpm_args)))
                       goto invalid_arg;
-                  }
 
                   {
-                      long name_len = strncpy_from_user(
-                          (char *)&kpm_name, (const char __user *)arg1, sizeof(kpm_name));
+                      long name_len = strncpy_from_user((char *)&kpm_name,
+                                                        (const char __user *)arg1,
+                                                        sizeof(kpm_name));
                       if (name_len <= 0) {
                           res = -EINVAL;
                           goto exit;
                       }
 
                       {
-                          long arg_len = strncpy_from_user(
-                              (char *)&kpm_args, (const char __user *)arg2, sizeof(kpm_args));
+                          long arg_len = strncpy_from_user((char *)&kpm_args,
+                                                           (const char __user *)arg2,
+                                                           sizeof(kpm_args));
 
-                          sukisu_kpm_control((const char *)&kpm_name, (const char *)&kpm_args,
+                          sukisu_kpm_control((const char *)&kpm_name,
+                                             (const char *)&kpm_args,
                                              arg_len, &res);
                       }
                   }
@@ -502,9 +623,8 @@ jobs:
                       if (len >= (int)outlen)
                           len = (int)outlen - 1;
 
-                      if (!kpm_access_ok_write(arg1, (size_t)(len + 1))) {
+                      if (!kpm_access_ok_write(arg1, (size_t)(len + 1)))
                           goto invalid_arg;
-                      }
 
                       res = copy_to_user((void __user *)arg1, &buffer, (size_t)(len + 1));
                   }
@@ -515,7 +635,7 @@ jobs:
                   if (!kpm_access_ok_write(result_code, sizeof(res)))
                       return 0;
                   if (copy_to_user((void __user *)result_code, &res, sizeof(res)) != 0)
-                      pr_info("kpm: Copy to user failed.");
+                      pr_info("kpm: Copy to user failed.\n");
               }
               return 0;
 
@@ -542,21 +662,17 @@ jobs:
                   return -EFAULT;
               }
 
-              /* cmd.control_code/cmd.result_code are user pointers in this design */
               if (!kpm_access_ok_read(cmd.control_code, sizeof(int))) {
-                  pr_err("kpm: invalid control_code pointer %px\n",
-                         (void *)cmd.control_code);
+                  pr_err("kpm: invalid control_code pointer %px\n", (void *)cmd.control_code);
                   return -EFAULT;
               }
 
               if (!kpm_access_ok_write(cmd.result_code, sizeof(int))) {
-                  pr_err("kpm: invalid result_code pointer %px\n",
-                         (void *)cmd.result_code);
+                  pr_err("kpm: invalid result_code pointer %px\n", (void *)cmd.result_code);
                   return -EFAULT;
               }
 
-              return sukisu_handle_kpm(cmd.control_code, cmd.arg1, cmd.arg2,
-                                       cmd.result_code);
+              return sukisu_handle_kpm(cmd.control_code, cmd.arg1, cmd.arg2, cmd.result_code);
           }
           EOF
 
@@ -566,7 +682,7 @@ jobs:
       # SusFS kernel patch (允许先产生 .rej，后面修复再放行)
       # ----------------------------
       - name: Patch SusFS (kernel source patch, allow rejs)
-        if: ${{ inputs.ENABLE_SUSFS == true }}
+        if: ${{ inputs.ENABLE_SUSFS }}
         shell: bash
         run: |
           set -euo pipefail
@@ -611,7 +727,7 @@ jobs:
           find . -maxdepth 6 -type f -name "*.rej" -print || true
 
       - name: Apply SusFS cmdline fix (OnePlus8 4.19)
-        if: ${{ inputs.ENABLE_SUSFS == true }}
+        if: ${{ inputs.ENABLE_SUSFS }}
         shell: bash
         run: |
           set -euo pipefail
@@ -630,7 +746,7 @@ jobs:
           fi
 
       - name: Apply SusFS fixups (task_mmu + uname) and cleanup rejs
-        if: ${{ inputs.ENABLE_SUSFS == true }}
+        if: ${{ inputs.ENABLE_SUSFS }}
         shell: bash
         run: |
           set -euo pipefail
@@ -798,6 +914,7 @@ jobs:
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-32/bin:$PATH"
           export KBUILD_BUILD_HOST=Github-Action
           export KBUILD_BUILD_USER="$(echo "${{ github.actor }}" | tr A-Z a-z)"
+          export CCACHE_DIR="${CCACHE_DIR:-$GITHUB_WORKSPACE/kernel_workspace/.ccache}"
 
           BA_ARGS=(
             CLANG_TRIPLE=aarch64-linux-gnu-
@@ -806,7 +923,7 @@ jobs:
           )
           EX_ARGS=(LD=ld.lld LLVM=1 LLVM_IAS=1)
 
-          make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" vendor/kona-perf_defconfig
+          make O=out CC="ccache clang" "${BA_ARGS[@]}" "${EX_ARGS[@]}" vendor/kona-perf_defconfig
 
           FRAGS=()
           for f in \
@@ -821,7 +938,7 @@ jobs:
 
           if [ "${#FRAGS[@]}" -gt 0 ]; then
             bash scripts/kconfig/merge_config.sh -m -O out out/.config "${FRAGS[@]}"
-            make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
+            make O=out CC="ccache clang" "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
           fi
 
           if [ "${{ inputs.ENABLE_KPM }}" = "true" ]; then
@@ -830,13 +947,16 @@ jobs:
                 sed -i 's/^# CONFIG_KPM is not set/CONFIG_KPM=y/' out/.config
               elif grep -q '^CONFIG_KPM=' out/.config; then
                 sed -i 's/^CONFIG_KPM=.*/CONFIG_KPM=y/' out/.config
+              else
+                echo "CONFIG_KPM=y" >> out/.config
               fi
             fi
-            make O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
+            make O=out CC="ccache clang" "${BA_ARGS[@]}" "${EX_ARGS[@]}" olddefconfig
           fi
 
-          make -j"$(nproc --all)" O=out CC=clang "${BA_ARGS[@]}" "${EX_ARGS[@]}" 2>&1 | tee error.log
+          make -j"$(nproc --all)" O=out CC="ccache clang" "${BA_ARGS[@]}" "${EX_ARGS[@]}" 2>&1 | tee error.log
           rc="${PIPESTATUS[0]}"
+          ccache -s || true
           exit "$rc"
 
       - name: Extract first errors (always)
@@ -883,7 +1003,7 @@ jobs:
       # KPM Inline Patcher
       # ----------------------------
       - name: KPM Inline Patcher
-        if: ${{ success() && inputs.ENABLE_KPM == true }}
+        if: ${{ success() && inputs.ENABLE_KPM }}
         shell: bash
         run: |
           set -euo pipefail
