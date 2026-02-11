@@ -272,7 +272,7 @@ jobs:
           path: kernel_workspace/AnyKernel3/*.zip
 
       # ----------------------------
-      # ✅ Telegram 通知
+      # ✅ Telegram 通知 (已修复换行问题)
       # ----------------------------
       - name: Send Success to Telegram
         if: success()
@@ -283,14 +283,15 @@ jobs:
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/AnyKernel3"
 
-          CAPTION=$'✅ *Kernel Build Success!*\\n\\n'
-          CAPTION+=$'🔸 *Branch:* ${{ inputs.LINEAGE_BRANCH }}\\n'
-          CAPTION+=$'🔸 *Kernel Version:* ${{ env.KERNEL_VERSION }}\\n\\n'
+          # 使用单反斜杠 \n 来表示真正的换行
+          CAPTION=$'✅ *Kernel Build Success!*\n\n'
+          CAPTION+=$'🔸 *Branch:* ${{ inputs.LINEAGE_BRANCH }}\n'
+          CAPTION+=$'🔸 *Kernel Version:* ${{ env.KERNEL_VERSION }}\n\n'
 
-          if [ "${{ inputs.ENABLE_KP }}" = "true" ]; then CAPTION+=$'🔹 *KernelPatch:* ✅\\n'; else CAPTION+=$'🔹 *KernelPatch:* ❌\\n'; fi
-          if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then CAPTION+=$'🔹 *LSM/BBG:* ✅\\n'; else CAPTION+=$'🔹 *LSM/BBG:* ❌\\n'; fi
-          if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then CAPTION+=$'🔹 *Netfilter:* ✅\\n'; else CAPTION+=$'🔹 *Netfilter:* ❌\\n'; fi
-          if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then CAPTION+=$'🔹 *BBR+ECN:* ✅\\n'; else CAPTION+=$'🔹 *BBR+ECN:* ❌\\n'; fi
+          if [ "${{ inputs.ENABLE_KP }}" = "true" ]; then CAPTION+=$'🔹 *KernelPatch:* ✅\n'; else CAPTION+=$'🔹 *KernelPatch:* ❌\n'; fi
+          if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then CAPTION+=$'🔹 *LSM/BBG:* ✅\n'; else CAPTION+=$'🔹 *LSM/BBG:* ❌\n'; fi
+          if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then CAPTION+=$'🔹 *Netfilter:* ✅\n'; else CAPTION+=$'🔹 *Netfilter:* ❌\n'; fi
+          if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then CAPTION+=$'🔹 *BBR+ECN:* ✅\n'; else CAPTION+=$'🔹 *BBR+ECN:* ❌\n'; fi
 
           curl -fLsS -F chat_id="$TELEGRAM_CHAT_ID" \
             -F document=@"${{ env.ZIP_NAME }}" \
@@ -305,9 +306,11 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euxo pipefail
-          MESSAGE=$'❌ *Kernel Build Failed!*\\n\\n'
-          MESSAGE+=$'🔸 *Branch:* ${{ inputs.LINEAGE_BRANCH }}\\n'
-          MESSAGE+=$'🔸 *Build User:* ${{ github.actor }}\\n\\n'
+          
+          # 同样修复这里的换行
+          MESSAGE=$'❌ *Kernel Build Failed!*\n\n'
+          MESSAGE+=$'🔸 *Branch:* ${{ inputs.LINEAGE_BRANCH }}\n'
+          MESSAGE+=$'🔸 *Build User:* ${{ github.actor }}\n\n'
           MESSAGE+=$'📋 *Logs:* [View Action Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})'
 
           curl -fLsS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
