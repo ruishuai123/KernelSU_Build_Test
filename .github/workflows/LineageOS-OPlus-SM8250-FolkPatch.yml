@@ -1,6 +1,6 @@
 name: Build LineageOS Kernel (Optimized + FolkPatch)
 
-on:1
+on:
   workflow_dispatch:
     inputs:
       LINEAGE_BRANCH:
