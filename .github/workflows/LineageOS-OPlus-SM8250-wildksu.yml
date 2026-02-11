@@ -1,4 +1,4 @@
-name: Build LineageOS Kernel (rsuntk + SusFS)
+name: Build LineageOS Kernel (WildKSU)
 
 on:
   workflow_dispatch:
@@ -8,13 +8,6 @@ on:
         required: true
         default: "lineage-23.2"
 
-      ENABLE_SUSFS:
-        description: "启用 SusFS v1.5.5 (稳定版)"
-        required: true
-        type: boolean
-        default: true
-
-      # ✅ 优化功能开关 (已移除 ZRAM)
       ENABLE_NETFILTER:
         description: "启用 NETFILTER (TTL/HL/TPROXY)"
         required: true
@@ -22,7 +15,7 @@ on:
         default: true
 
       ENABLE_BBR:
-        description: "启用 BBR + ECN (TCP优化)"
+        description: "启用 BBR + ECN + FQ (TCP优化)"
         required: true
         type: boolean
         default: true
@@ -40,7 +33,7 @@ env:
 
 jobs:
   build:
-    name: Build Kernel (rsuntk)
+    name: Build Kernel (WildKSU)
     runs-on: ubuntu-latest
 
     steps:
@@ -120,15 +113,15 @@ jobs:
             android-kernel --depth=1
 
       # ----------------------------
-      # KernelSU + patch
+      # WildKSU + patch
       # ----------------------------
-      - name: Set up KernelSU (rsuntk)
+      - name: Set up WildKSU
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
-          # curl 更稳：失败就退出；不输出进度；跟随重定向
-          curl -fLsS https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s main
+          # WildKSU 官方集成脚本
+          curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" | bash -s wild
 
           # 允许失败：你原本就是 || true
           bash "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" || true
@@ -149,58 +142,25 @@ jobs:
 
           set_kcfg "CONFIG_KSU_MANUAL_HOOK" "y" "$CONFIG_FILE"
 
-          RSKSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
-          echo "RSKSUVER=$RSKSUVER" >> $GITHUB_ENV
+          # 版本号：commit count + 30000（尽量兼容不同目录名）
+          if [ -d "KernelSU" ]; then
+            KSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
+          elif [ -d "Wild_KSU" ]; then
+            KSUVER=$(cd Wild_KSU && expr $(git rev-list --count HEAD) + 30000)
+          else
+            KSU_DIR="$(find . -maxdepth 2 -type d \( -name "KernelSU" -o -name "Wild_KSU" \) | head -n 1 || true)"
+            if [ -n "$KSU_DIR" ]; then
+              KSUVER=$(cd "$KSU_DIR" && expr $(git rev-list --count HEAD) + 30000)
+            else
+              KSUVER="unknown"
+            fi
+          fi
 
+          echo "KSUVER=$KSUVER" >> $GITHUB_ENV
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
       # ----------------------------
-      # SusFS 注入
-      # ----------------------------
-      - name: Inject SusFS (kernel-4.19)
-        if: inputs.ENABLE_SUSFS == true
-        run: |
-          set -euxo pipefail
-          cd "$GITHUB_WORKSPACE/kernel_workspace"
-
-          echo "⬇️ Cloning SusFS (kernel-4.19 branch)..."
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
-
-          SUSFS_DIR="$(pwd)/susfs4ksu"
-          cd android-kernel
-
-          echo "📋 Copying SusFS files from kernel_patches..."
-          cp -af "${SUSFS_DIR}/kernel_patches/fs/"* fs/
-          cp -af "${SUSFS_DIR}/kernel_patches/include/linux/"* include/linux/
-
-          CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
-
-          set_kcfg() {
-            local key="$1"
-            local val="$2"
-            local file="$3"
-            if grep -qE "^${key}=" "$file"; then
-              sed -i "s/^${key}=.*/${key}=${val}/" "$file"
-            else
-              echo "${key}=${val}" >> "$file"
-            fi
-          }
-
-          echo "🔧 Enabling SusFS Configs..."
-          set_kcfg "CONFIG_KSU_SUSFS" "y" "$CONFIG_FILE"
-          set_kcfg "CONFIG_KSU_SUSFS_SUS_PATH" "y" "$CONFIG_FILE"
-          set_kcfg "CONFIG_KSU_SUSFS_SUS_MOUNT" "y" "$CONFIG_FILE"
-          set_kcfg "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT" "y" "$CONFIG_FILE"
-          set_kcfg "CONFIG_KSU_SUSFS_SUS_KSTAT" "y" "$CONFIG_FILE"
-          set_kcfg "CONFIG_KSU_SUSFS_SUS_OVERLAYFS" "y" "$CONFIG_FILE"
-          set_kcfg "CONFIG_KSU_SUSFS_TRY_UMOUNT" "y" "$CONFIG_FILE"
-          set_kcfg "CONFIG_KSU_SUSFS_SPOOF_UNAME" "y" "$CONFIG_FILE"
-
-          echo "SUSFS_VERSION=kernel-4.19" >> $GITHUB_ENV
-          echo "✅ SusFS injection process completed."
-
-      # ----------------------------
-      # ✅ 注入内核优化扩展 (已移除 ZRAM)
+      # ✅ 注入内核优化扩展
       # ----------------------------
       - name: Inject Kernel Extensions
         run: |
@@ -226,7 +186,7 @@ jobs:
 
             set_kcfg "CONFIG_BBG" "y" "$CONFIG_FILE"
 
-            # 修复：将 baseband_guard 加入 security/Kconfig 的默认 LSM 列表（若已存在则不重复加）
+            # 将 baseband_guard 加入 security/Kconfig 的默认 LSM 列表（若已存在则不重复加）
             sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
           fi
 
@@ -239,13 +199,20 @@ jobs:
             set_kcfg "CONFIG_NETFILTER_XT_MATCH_TPROXY" "y" "$CONFIG_FILE"
           fi
 
-          # 3) BBR + ECN
+          # 3) BBR + ECN + FQ（同时把 fq 设为默认 qdisc）
           if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then
-            echo "🚀 Enabling TCP BBR + ECN..."
+            echo "🚀 Enabling TCP BBR + ECN + FQ..."
+            # BBR/ECN
             set_kcfg "CONFIG_TCP_CONG_BBR" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_DEFAULT_BBR" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_IP_ECN" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_TCP_ECN" "y" "$CONFIG_FILE"
+
+            # FQ qdisc
+            set_kcfg "CONFIG_NET_SCH_DEFAULT" "y" "$CONFIG_FILE"
+            set_kcfg "CONFIG_NET_SCH_FQ" "y" "$CONFIG_FILE"
+            set_kcfg "CONFIG_DEFAULT_FQ" "y" "$CONFIG_FILE"
+            set_kcfg "CONFIG_DEFAULT_NET_SCH" "\"fq\"" "$CONFIG_FILE"
           fi
 
       # ----------------------------
@@ -302,22 +269,17 @@ jobs:
           cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
           cd AnyKernel3
 
-          SUS_TAG=""
-          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
-            SUS_TAG="-SusFS"
-          fi
-
-          zip -r "AK3-${{ inputs.LINEAGE_BRANCH }}-OPlus-SM8250-rsuntk${SUS_TAG}_KSU_${{ env.RSKSUVER }}.zip" ./*
+          zip -r "AK3-${{ inputs.LINEAGE_BRANCH }}-OPlus-SM8250_WildKSU_${{ env.KSUVER }}.zip" ./*
           echo "ZIP_NAME=$(ls *.zip)" >> $GITHUB_ENV
 
       - name: Upload AnyKernel3 ZIP (GitHub Artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: AK3-rsuntk
+          name: AK3-WildKSU
           path: kernel_workspace/AnyKernel3/*.zip
 
       # ----------------------------
-      # ✅ Telegram 通知
+      # ✅ Telegram 通知（正常换行）
       # ----------------------------
       - name: Send Success to Telegram
         if: success()
@@ -328,15 +290,14 @@ jobs:
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/AnyKernel3"
 
-          CAPTION="✅ *Kernel Build Success!*%0A%0A"
-          CAPTION+="🔸 *Branch:* ${{ inputs.LINEAGE_BRANCH }}%0A"
-          CAPTION+="🔸 *Kernel Version:* ${{ env.KERNEL_VERSION }}%0A"
-          CAPTION+="🔸 *KSU Version:* ${{ env.RSKSUVER }}%0A%0A"
+          CAPTION=$'✅ *Kernel Build Success!*\n\n'
+          CAPTION+=$'🔸 *Branch:* '"${{ inputs.LINEAGE_BRANCH }}"$'\n'
+          CAPTION+=$'🔸 *Kernel Version:* '"${{ env.KERNEL_VERSION }}"$'\n'
+          CAPTION+=$'🔸 *KSU Version:* '"${{ env.KSUVER }}"$'\n'
 
-          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then CAPTION+="🔹 *SusFS:* ✅%0A"; else CAPTION+="🔹 *SusFS:* ❌%0A"; fi
-          if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then CAPTION+="🔹 *LSM/BBG:* ✅%0A"; else CAPTION+="🔹 *LSM/BBG:* ❌%0A"; fi
-          if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then CAPTION+="🔹 *Netfilter:* ✅%0A"; else CAPTION+="🔹 *Netfilter:* ❌%0A"; fi
-          if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then CAPTION+="🔹 *BBR+ECN:* ✅%0A"; else CAPTION+="🔹 *BBR+ECN:* ❌%0A"; fi
+          if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then CAPTION+=$'🔹 *LSM/BBG:* ✅\n'; else CAPTION+=$'🔹 *LSM/BBG:* ❌\n'; fi
+          if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then CAPTION+=$'🔹 *Netfilter:* ✅\n'; else CAPTION+=$'🔹 *Netfilter:* ❌\n'; fi
+          if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then CAPTION+=$'🔹 *BBR+ECN+FQ:* ✅\n'; else CAPTION+=$'🔹 *BBR+ECN+FQ:* ❌\n'; fi
 
           curl -fLsS -F chat_id="$TELEGRAM_CHAT_ID" \
             -F document=@"${{ env.ZIP_NAME }}" \
@@ -351,10 +312,11 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euxo pipefail
-          MESSAGE="❌ *Kernel Build Failed!*%0A%0A"
-          MESSAGE+="🔸 *Branch:* ${{ inputs.LINEAGE_BRANCH }}%0A"
-          MESSAGE+="🔸 *Build User:* ${{ github.actor }}%0A%0A"
-          MESSAGE+="📋 *Logs:* [View Action Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+          MESSAGE=$'❌ *Kernel Build Failed!*\n\n'
+          MESSAGE+=$'🔸 *Branch:* '"${{ inputs.LINEAGE_BRANCH }}"$'\n'
+          MESSAGE+=$'🔸 *Build User:* '"${{ github.actor }}"$'\n'
+          MESSAGE+=$'📋 *Logs:* [View Action Run]('"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"$')'
 
           curl -fLsS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
             -d chat_id="$TELEGRAM_CHAT_ID" \
