@@ -491,6 +491,7 @@ jobs:
             kernel_workspace/android-kernel/out/arch/arm64/boot/Image
             kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz
             kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz-dtb
+            kernel_workspace/android-kernel/drivers/kernelsu/kpm/kpm.c
           if-no-files-found: ignore
 
       # ----------------------------
