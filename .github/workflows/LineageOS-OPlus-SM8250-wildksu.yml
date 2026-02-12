@@ -1,4 +1,4 @@
-name: Build LineageOS Kernel (WildKSU)
+name: Build LineageOS Kernel (WildKSU + SUSFS)
 
 on:
   workflow_dispatch:
@@ -30,12 +30,11 @@ env:
   TZ: Asia/Shanghai
   CLANG_VERSION: clang-r547379
   GCC_TAG: android-12.1.0_r27
-  # ✅ Wild_KSU 选用稳定分支（避免 wild 分支不存在导致 setup 失败）
   WILDKSU_REF: stable
 
 jobs:
   build:
-    name: Build Kernel (WildKSU)
+    name: Build Kernel (WildKSU + SUSFS)
     runs-on: ubuntu-latest
 
     steps:
@@ -58,7 +57,7 @@ jobs:
           sudo apt-get install -y \
             git ccache automake flex lzop bison gperf build-essential zip curl \
             zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools \
-            dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev wget
+            dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev wget unzip
 
           mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
 
@@ -104,7 +103,7 @@ jobs:
       # ----------------------------
       # Kernel source
       # ----------------------------
-      - name: Download kernel source
+      - name: Download kernel source (LineageOS oneplus sm8250)
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace"
@@ -115,18 +114,17 @@ jobs:
             android-kernel --depth=1
 
       # ----------------------------
-      # WildKSU + patch
+      # WildKSU
       # ----------------------------
       - name: Set up WildKSU (stable, local checkout)
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
-          # ✅ 最稳：clone Wild_KSU 仓库到本地，再运行 setup.sh（避免 raw 链接/分支变化/404）
           rm -rf Wild_KSU
           git clone --depth=1 -b "${{ env.WILDKSU_REF }}" https://github.com/WildKernels/Wild_KSU Wild_KSU
 
-          # ✅ 在内核源码树里执行 setup.sh，将 kernelsu driver 注入到 drivers/ 等位置
+          # 在内核源码树中执行注入
           bash Wild_KSU/kernel/setup.sh "${{ env.WILDKSU_REF }}"
 
           # 允许失败：保持你原先逻辑
@@ -134,7 +132,6 @@ jobs:
 
           CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
 
-          # ✅ defconfig 去重写入：有则替换，无则追加
           set_kcfg() {
             local key="$1"
             local val="$2"
@@ -148,14 +145,46 @@ jobs:
 
           set_kcfg "CONFIG_KSU_MANUAL_HOOK" "y" "$CONFIG_FILE"
 
-          # ✅ KSUVER：用 Wild_KSU 的 commit count + 30000（保证目录是 git 仓库）
+          # Wild_KSU 版本号
           KSUVER=$(cd Wild_KSU && expr $(git rev-list --count HEAD) + 30000)
           echo "KSUVER=$KSUVER" >> $GITHUB_ENV
 
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
       # ----------------------------
-      # ✅ 注入内核优化扩展
+      # ✅ SUSFS (from your zip)
+      # ----------------------------
+      - name: Integrate SUSFS (kernel-4.19 from patches/susfs4ksu-kernel-4.19.zip)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+
+          SUSFS_ZIP="$GITHUB_WORKSPACE/patches/susfs4ksu-kernel-4.19.zip"
+
+          rm -rf /tmp/susfs4ksu
+          mkdir -p /tmp/susfs4ksu
+          unzip -q "$SUSFS_ZIP" -d /tmp/susfs4ksu
+
+          # 你的 zip 根目录名（如果以后你换了压缩方式，这里改成实际目录名即可）
+          SUSFS_DIR="/tmp/susfs4ksu/susfs4ksu-kernel-4.19"
+
+          # 1) 应用内核补丁（把 susfs 接入 fs/Kconfig/fs/Makefile 等）
+          git apply --whitespace=fix "$SUSFS_DIR/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
+
+          # 2) 放入 SUSFS 本体文件（解决 fs/susfs.c 和 linux/susfs.h 缺失）
+          install -m 0644 "$SUSFS_DIR/kernel_patches/fs/susfs.c" fs/susfs.c
+          install -m 0644 "$SUSFS_DIR/kernel_patches/include/linux/susfs.h" include/linux/susfs.h
+          install -m 0644 "$SUSFS_DIR/kernel_patches/include/linux/susfs_def.h" include/linux/susfs_def.h
+
+          # 3) 断言检查（避免跑到 make 才炸）
+          test -f fs/susfs.c
+          test -f include/linux/susfs.h
+          test -f include/linux/susfs_def.h
+
+          echo "✅ SUSFS integrated into kernel tree."
+
+      # ----------------------------
+      # ✅ 内核扩展（LSM / NETFILTER / BBR）
       # ----------------------------
       - name: Inject Kernel Extensions
         run: |
@@ -177,12 +206,10 @@ jobs:
           # 1) LSM / Baseband Guard
           if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then
             echo "🛡️ Setting up Baseband Guard (LSM)..."
-            # ✅ 加 -f：下载失败直接退出，不会把 HTML 喂给 bash
             curl -fLsS https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh | bash
 
             set_kcfg "CONFIG_BBG" "y" "$CONFIG_FILE"
 
-            # 将 baseband_guard 加入 security/Kconfig 的默认 LSM 列表（若已存在则不重复加）
             sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
           fi
 
@@ -195,16 +222,14 @@ jobs:
             set_kcfg "CONFIG_NETFILTER_XT_MATCH_TPROXY" "y" "$CONFIG_FILE"
           fi
 
-          # 3) BBR + ECN + FQ（同时把 fq 设为默认 qdisc）
+          # 3) BBR + ECN + FQ
           if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then
             echo "🚀 Enabling TCP BBR + ECN + FQ..."
-            # BBR/ECN
             set_kcfg "CONFIG_TCP_CONG_BBR" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_DEFAULT_BBR" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_IP_ECN" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_TCP_ECN" "y" "$CONFIG_FILE"
 
-            # FQ qdisc
             set_kcfg "CONFIG_NET_SCH_DEFAULT" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_NET_SCH_FQ" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_DEFAULT_FQ" "y" "$CONFIG_FILE"
@@ -275,7 +300,7 @@ jobs:
           path: kernel_workspace/AnyKernel3/*.zip
 
       # ----------------------------
-      # ✅ Telegram 通知（正常换行）
+      # Telegram notify
       # ----------------------------
       - name: Send Success to Telegram
         if: success()
