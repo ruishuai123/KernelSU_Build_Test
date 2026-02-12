@@ -57,7 +57,7 @@ jobs:
           sudo apt-get install -y \
             git ccache automake flex lzop bison gperf build-essential zip curl \
             zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools \
-            dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev wget unzip
+            dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev wget unzip perl
 
           mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
 
@@ -124,7 +124,7 @@ jobs:
           rm -rf Wild_KSU
           git clone --depth=1 -b "${{ env.WILDKSU_REF }}" https://github.com/WildKernels/Wild_KSU Wild_KSU
 
-          # 在内核源码树中执行注入
+          # 注入 WildKSU 到当前内核树
           bash Wild_KSU/kernel/setup.sh "${{ env.WILDKSU_REF }}"
 
           # 允许失败：保持你原先逻辑
@@ -151,7 +151,10 @@ jobs:
 
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
-      - name: Integrate SUSFS (LineageOS-friendly minimal)
+      # ----------------------------
+      # ✅ SUSFS (from your zip) - Lineage-friendly minimal integration
+      # ----------------------------
+      - name: Integrate SUSFS (minimal, avoid patch conflicts)
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
@@ -162,6 +165,7 @@ jobs:
           mkdir -p /tmp/susfs4ksu
           unzip -q "$SUSFS_ZIP" -d /tmp/susfs4ksu
 
+          # 自动找 zip 解压后的根目录（避免目录名变化）
           SUSFS_DIR="$(find /tmp/susfs4ksu -maxdepth 2 -type d -name 'susfs4ksu-kernel-4.19' | head -n 1 || true)"
           if [ -z "$SUSFS_DIR" ]; then
             SUSFS_DIR="$(find /tmp/susfs4ksu -maxdepth 2 -type d -name '*susfs*4.19*' | head -n 1 || true)"
@@ -173,29 +177,27 @@ jobs:
           install -m 0644 "$SUSFS_DIR/kernel_patches/include/linux/susfs.h" include/linux/susfs.h
           install -m 0644 "$SUSFS_DIR/kernel_patches/include/linux/susfs_def.h" include/linux/susfs_def.h
 
-          # 2) 让 fs/Makefile 在开启 CONFIG_KSU_SUSFS 时编译 susfs.o（不依赖大 patch）
+          # 2) 让 fs/Makefile 在开启 CONFIG_KSU_SUSFS 时编译 susfs.o（不依赖大 patch，避免冲突）
           if ! grep -qE 'obj-\$\(CONFIG_KSU_SUSFS\)\s*\+=\s*susfs\.o' fs/Makefile; then
             echo "" >> fs/Makefile
             echo "# KernelSU SUSFS" >> fs/Makefile
             echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
           fi
 
-          # 3) 适配 LineageOS 的 include/linux/mount.h：把 susfs_mnt_id_backup 塞进 KABI reserve slot
-          #    （你的 vfsmount 是 void *data 在 reserve 前面，原 patch 的上下文对不上，所以这里用替换法）
+          # 3) LineageOS mount.h 适配：在 KABI slot 放一个备份字段，防止 susfs/ksu 侧引用缺字段
+          #    你的 include/linux/mount.h 有 ANDROID_KABI_RESERVE(4)
           if grep -q 'ANDROID_KABI_RESERVE(4);' include/linux/mount.h && ! grep -q 'susfs_mnt_id_backup' include/linux/mount.h; then
             perl -0777 -i -pe 's/ANDROID_KABI_RESERVE\(4\);\n/\
-#ifdef CONFIG_KSU_SUSFS\n\tANDROID_KABI_USE(4, u64 susfs_mnt_id_backup);\n#else\n\tANDROID_KABI_RESERVE(4);\n#endif\n#if defined(CONFIG_KSU_SUSFS) \&\& !defined(ANDROID_KABI_RESERVE)\n\tu64 susfs_mnt_id_backup;\n#endif\n/sg' include/linux/mount.h
+#ifdef CONFIG_KSU_SUSFS\n\tANDROID_KABI_USE(4, u64 susfs_mnt_id_backup);\n#else\n\tANDROID_KABI_RESERVE(4);\n#endif\n#if defined(CONFIG_KSU_SUSFS) \&\& !defined(ANDROID_KABI_USE)\n\tu64 susfs_mnt_id_backup;\n#endif\n/sg' include/linux/mount.h
           fi
 
-          # 4) 校验关键文件
+          # 4) 校验（避免跑到 make 才炸）
           test -f fs/susfs.c
           test -f include/linux/susfs.h
           test -f include/linux/susfs_def.h
           grep -qE 'obj-\$\(CONFIG_KSU_SUSFS\)\s*\+=\s*susfs\.o' fs/Makefile
-          grep -q 'susfs_mnt_id_backup' include/linux/mount.h || true
 
-          echo "✅ SUSFS minimal integration done for LineageOS tree."
-
+          echo "✅ SUSFS minimal integration done."
 
       # ----------------------------
       # ✅ 内核扩展（LSM / NETFILTER / BBR）
