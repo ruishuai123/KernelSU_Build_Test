@@ -160,7 +160,11 @@ jobs:
           F="drivers/kernelsu/allowlist.c"
           test -f "$F"
 
-          # Ensure put_task_struct() is declared
+          # (A) 清理之前错误插入的那一行（包含 \n 的整行垃圾）
+          #     以及任何可能重复插入的 TWA_RESUME 块（避免多次插入）
+          sed -i '/TWA_RESUME\\n#define TWA_RESUME 0\\n#endif\\n/d' "$F"
+
+          # (B) 确保 put_task_struct() 声明可见
           if ! grep -qE '^\s*#include\s*<linux/sched/task\.h>' "$F"; then
             if grep -qE '^\s*#include\s*<linux/sched\.h>' "$F"; then
               sed -i '/^\s*#include\s*<linux\/sched\.h>/a #include <linux/sched/task.h>' "$F"
@@ -169,18 +173,31 @@ jobs:
             fi
           fi
 
-          # Older kernels may not define TWA_RESUME
-          if ! grep -qE '^\s*#ifndef\s+TWA_RESUME' "$F"; then
+          # (C) 老内核没有 TWA_RESUME：在 include 区之后插入真正换行的宏定义
+          if ! grep -qE '^\s*#ifndef\s+TWA_RESUME\s*$' "$F"; then
             last_inc_line="$(grep -nE '^\s*#include' "$F" | tail -n 1 | cut -d: -f1 || true)"
-            if [ -n "$last_inc_line" ]; then
-              sed -i "${last_inc_line}a\\\n#ifndef TWA_RESUME\\\n#define TWA_RESUME 0\\\n#endif\\\n" "$F"
-            else
-              sed -i "1i #ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n" "$F"
+            if [ -z "$last_inc_line" ]; then
+              last_inc_line=1
             fi
+
+            tmp="$(mktemp)"
+            awk -v L="$last_inc_line" '
+              NR==L {
+                print $0
+                print ""
+                print "#ifndef TWA_RESUME"
+                print "#define TWA_RESUME 0"
+                print "#endif"
+                print ""
+                next
+              }
+              { print $0 }
+            ' "$F" > "$tmp"
+            mv "$tmp" "$F"
           fi
 
           echo "Patched allowlist.c markers:"
-          grep -nE 'sched/task\.h|TWA_RESUME' "$F" || true
+          grep -nE 'sched/task\.h|^#ifndef TWA_RESUME|^#define TWA_RESUME' "$F" || true
 
       # ----------------------------
       # SUSFS (from your zip) - minimal integration (no big patch apply)
@@ -202,19 +219,16 @@ jobs:
           fi
           test -n "$SUSFS_DIR"
 
-          # Copy SUSFS sources/headers into kernel tree
           install -m 0644 "$SUSFS_DIR/kernel_patches/fs/susfs.c" fs/susfs.c
           install -m 0644 "$SUSFS_DIR/kernel_patches/include/linux/susfs.h" include/linux/susfs.h
           install -m 0644 "$SUSFS_DIR/kernel_patches/include/linux/susfs_def.h" include/linux/susfs_def.h
 
-          # Ensure fs/Makefile builds susfs.o when CONFIG_KSU_SUSFS is enabled
           if ! grep -qE 'obj-\$\(CONFIG_KSU_SUSFS\)[[:space:]]*\+=[[:space:]]*susfs\.o' fs/Makefile; then
             echo "" >> fs/Makefile
             echo "# KernelSU SUSFS" >> fs/Makefile
             echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
           fi
 
-          # Sanity checks
           test -f fs/susfs.c
           test -f include/linux/susfs.h
           test -f include/linux/susfs_def.h
