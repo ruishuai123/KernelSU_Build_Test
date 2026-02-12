@@ -30,6 +30,8 @@ env:
   TZ: Asia/Shanghai
   CLANG_VERSION: clang-r547379
   GCC_TAG: android-12.1.0_r27
+  # ✅ Wild_KSU 选用稳定分支（避免 wild 分支不存在导致 setup 失败）
+  WILDKSU_REF: stable
 
 jobs:
   build:
@@ -56,7 +58,7 @@ jobs:
           sudo apt-get install -y \
             git ccache automake flex lzop bison gperf build-essential zip curl \
             zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools \
-            dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev
+            dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev wget
 
           mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
 
@@ -115,15 +117,19 @@ jobs:
       # ----------------------------
       # WildKSU + patch
       # ----------------------------
-      - name: Set up WildKSU
+      - name: Set up WildKSU (stable, local checkout)
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
-          # WildKSU 官方集成脚本
-          curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" | bash -s wild
+          # ✅ 最稳：clone Wild_KSU 仓库到本地，再运行 setup.sh（避免 raw 链接/分支变化/404）
+          rm -rf Wild_KSU
+          git clone --depth=1 -b "${{ env.WILDKSU_REF }}" https://github.com/WildKernels/Wild_KSU Wild_KSU
 
-          # 允许失败：你原本就是 || true
+          # ✅ 在内核源码树里执行 setup.sh，将 kernelsu driver 注入到 drivers/ 等位置
+          bash Wild_KSU/kernel/setup.sh "${{ env.WILDKSU_REF }}"
+
+          # 允许失败：保持你原先逻辑
           bash "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" || true
 
           CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
@@ -142,21 +148,10 @@ jobs:
 
           set_kcfg "CONFIG_KSU_MANUAL_HOOK" "y" "$CONFIG_FILE"
 
-          # 版本号：commit count + 30000（尽量兼容不同目录名）
-          if [ -d "KernelSU" ]; then
-            KSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
-          elif [ -d "Wild_KSU" ]; then
-            KSUVER=$(cd Wild_KSU && expr $(git rev-list --count HEAD) + 30000)
-          else
-            KSU_DIR="$(find . -maxdepth 2 -type d \( -name "KernelSU" -o -name "Wild_KSU" \) | head -n 1 || true)"
-            if [ -n "$KSU_DIR" ]; then
-              KSUVER=$(cd "$KSU_DIR" && expr $(git rev-list --count HEAD) + 30000)
-            else
-              KSUVER="unknown"
-            fi
-          fi
-
+          # ✅ KSUVER：用 Wild_KSU 的 commit count + 30000（保证目录是 git 仓库）
+          KSUVER=$(cd Wild_KSU && expr $(git rev-list --count HEAD) + 30000)
           echo "KSUVER=$KSUVER" >> $GITHUB_ENV
+
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
       # ----------------------------
@@ -182,6 +177,7 @@ jobs:
           # 1) LSM / Baseband Guard
           if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then
             echo "🛡️ Setting up Baseband Guard (LSM)..."
+            # ✅ 加 -f：下载失败直接退出，不会把 HTML 喂给 bash
             curl -fLsS https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh | bash
 
             set_kcfg "CONFIG_BBG" "y" "$CONFIG_FILE"
