@@ -4,24 +4,24 @@ on:
   workflow_dispatch:
     inputs:
       LINEAGE_BRANCH:
-        description: "LineageOS 分支 (例如 lineage-23.2)"
+        description: "LineageOS branch (e.g. lineage-23.2)"
         required: true
         default: "lineage-23.2"
 
       ENABLE_NETFILTER:
-        description: "启用 NETFILTER (TTL/HL/TPROXY)"
+        description: "Enable NETFILTER (TTL/HL/TPROXY)"
         required: true
         type: boolean
         default: true
 
       ENABLE_BBR:
-        description: "启用 BBR + ECN + FQ (TCP优化)"
+        description: "Enable BBR + ECN + FQ"
         required: true
         type: boolean
         default: true
 
       ENABLE_LSM:
-        description: "启用 LSM / BBG (基带保护)"
+        description: "Enable LSM / BBG"
         required: true
         type: boolean
         default: true
@@ -46,18 +46,18 @@ jobs:
         with:
           swap-size-gb: 10
 
-      - name: Setup build kernel environment
+      - name: Setup build environment
         run: |
           set -euxo pipefail
 
-          echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> $GITHUB_ENV
-          echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> $GITHUB_ENV
+          echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> "$GITHUB_ENV"
+          echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> "$GITHUB_ENV"
 
           sudo apt-get update
           sudo apt-get install -y \
             git ccache automake flex lzop bison gperf build-essential zip curl \
             zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools \
-            dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev wget unzip perl
+            dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev wget unzip
 
           mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
 
@@ -116,7 +116,7 @@ jobs:
       # ----------------------------
       # WildKSU
       # ----------------------------
-      - name: Set up WildKSU (stable, local checkout)
+      - name: Set up WildKSU
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
@@ -124,18 +124,17 @@ jobs:
           rm -rf Wild_KSU
           git clone --depth=1 -b "${{ env.WILDKSU_REF }}" https://github.com/WildKernels/Wild_KSU Wild_KSU
 
-          # 注入 WildKSU 到当前内核树
           bash Wild_KSU/kernel/setup.sh "${{ env.WILDKSU_REF }}"
 
-          # 允许失败：保持你原先逻辑
+          # keep your original optional patch
           bash "$GITHUB_WORKSPACE/patches/kernel-4.19_5.4-patch.sh" || true
 
           CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
 
           set_kcfg() {
-            local key="$1"
-            local val="$2"
-            local file="$3"
+            key="$1"
+            val="$2"
+            file="$3"
             if grep -qE "^${key}=" "$file"; then
               sed -i "s/^${key}=.*/${key}=${val}/" "$file"
             else
@@ -145,16 +144,15 @@ jobs:
 
           set_kcfg "CONFIG_KSU_MANUAL_HOOK" "y" "$CONFIG_FILE"
 
-          # Wild_KSU 版本号
           KSUVER=$(cd Wild_KSU && expr $(git rev-list --count HEAD) + 30000)
-          echo "KSUVER=$KSUVER" >> $GITHUB_ENV
+          echo "KSUVER=$KSUVER" >> "$GITHUB_ENV"
 
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
       # ----------------------------
-      # ✅ SUSFS (from your zip) - Lineage-friendly minimal integration
+      # SUSFS (from your zip) - minimal integration (no big patch apply)
       # ----------------------------
-      - name: Integrate SUSFS (minimal, avoid patch conflicts)
+      - name: Integrate SUSFS from zip (minimal)
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
@@ -165,42 +163,34 @@ jobs:
           mkdir -p /tmp/susfs4ksu
           unzip -q "$SUSFS_ZIP" -d /tmp/susfs4ksu
 
-          # 自动找 zip 解压后的根目录（避免目录名变化）
           SUSFS_DIR="$(find /tmp/susfs4ksu -maxdepth 2 -type d -name 'susfs4ksu-kernel-4.19' | head -n 1 || true)"
           if [ -z "$SUSFS_DIR" ]; then
             SUSFS_DIR="$(find /tmp/susfs4ksu -maxdepth 2 -type d -name '*susfs*4.19*' | head -n 1 || true)"
           fi
           test -n "$SUSFS_DIR"
 
-          # 1) 放入 SUSFS 本体文件（解决 fs/susfs.c / linux/susfs.h 缺失）
+          # Copy SUSFS sources/headers into kernel tree
           install -m 0644 "$SUSFS_DIR/kernel_patches/fs/susfs.c" fs/susfs.c
           install -m 0644 "$SUSFS_DIR/kernel_patches/include/linux/susfs.h" include/linux/susfs.h
           install -m 0644 "$SUSFS_DIR/kernel_patches/include/linux/susfs_def.h" include/linux/susfs_def.h
 
-          # 2) 让 fs/Makefile 在开启 CONFIG_KSU_SUSFS 时编译 susfs.o（不依赖大 patch，避免冲突）
-          if ! grep -qE 'obj-\$\(CONFIG_KSU_SUSFS\)\s*\+=\s*susfs\.o' fs/Makefile; then
+          # Ensure fs/Makefile builds susfs.o when CONFIG_KSU_SUSFS is enabled
+          if ! grep -qE 'obj-\$\(CONFIG_KSU_SUSFS\)[[:space:]]*\+=[[:space:]]*susfs\.o' fs/Makefile; then
             echo "" >> fs/Makefile
             echo "# KernelSU SUSFS" >> fs/Makefile
             echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
           fi
 
-          # 3) LineageOS mount.h 适配：在 KABI slot 放一个备份字段，防止 susfs/ksu 侧引用缺字段
-          #    你的 include/linux/mount.h 有 ANDROID_KABI_RESERVE(4)
-          if grep -q 'ANDROID_KABI_RESERVE(4);' include/linux/mount.h && ! grep -q 'susfs_mnt_id_backup' include/linux/mount.h; then
-            perl -0777 -i -pe 's/ANDROID_KABI_RESERVE\(4\);\n/\
-#ifdef CONFIG_KSU_SUSFS\n\tANDROID_KABI_USE(4, u64 susfs_mnt_id_backup);\n#else\n\tANDROID_KABI_RESERVE(4);\n#endif\n#if defined(CONFIG_KSU_SUSFS) \&\& !defined(ANDROID_KABI_USE)\n\tu64 susfs_mnt_id_backup;\n#endif\n/sg' include/linux/mount.h
-          fi
-
-          # 4) 校验（避免跑到 make 才炸）
+          # Sanity checks
           test -f fs/susfs.c
           test -f include/linux/susfs.h
           test -f include/linux/susfs_def.h
-          grep -qE 'obj-\$\(CONFIG_KSU_SUSFS\)\s*\+=\s*susfs\.o' fs/Makefile
+          grep -qE 'obj-\$\(CONFIG_KSU_SUSFS\)[[:space:]]*\+=[[:space:]]*susfs\.o' fs/Makefile
 
-          echo "✅ SUSFS minimal integration done."
+          echo "SUSFS minimal integration done."
 
       # ----------------------------
-      # ✅ 内核扩展（LSM / NETFILTER / BBR）
+      # Optional extensions
       # ----------------------------
       - name: Inject Kernel Extensions
         run: |
@@ -209,9 +199,9 @@ jobs:
           CONFIG_FILE="arch/arm64/configs/vendor/kona-perf_defconfig"
 
           set_kcfg() {
-            local key="$1"
-            local val="$2"
-            local file="$3"
+            key="$1"
+            val="$2"
+            file="$3"
             if grep -qE "^${key}=" "$file"; then
               sed -i "s/^${key}=.*/${key}=${val}/" "$file"
             else
@@ -219,28 +209,20 @@ jobs:
             fi
           }
 
-          # 1) LSM / Baseband Guard
           if [ "${{ inputs.ENABLE_LSM }}" = "true" ]; then
-            echo "🛡️ Setting up Baseband Guard (LSM)..."
             curl -fLsS https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh | bash
-
             set_kcfg "CONFIG_BBG" "y" "$CONFIG_FILE"
-
             sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
           fi
 
-          # 2) NETFILTER (TTL/HL/TPROXY)
           if [ "${{ inputs.ENABLE_NETFILTER }}" = "true" ]; then
-            echo "🌐 Enabling Netfilter enhancements..."
             set_kcfg "CONFIG_NETFILTER_XT_TARGET_TTL" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_NETFILTER_XT_TARGET_HL" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_NETFILTER_XT_MATCH_HL" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_NETFILTER_XT_MATCH_TPROXY" "y" "$CONFIG_FILE"
           fi
 
-          # 3) BBR + ECN + FQ
           if [ "${{ inputs.ENABLE_BBR }}" = "true" ]; then
-            echo "🚀 Enabling TCP BBR + ECN + FQ..."
             set_kcfg "CONFIG_TCP_CONG_BBR" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_DEFAULT_BBR" "y" "$CONFIG_FILE"
             set_kcfg "CONFIG_IP_ECN" "y" "$CONFIG_FILE"
@@ -280,8 +262,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel/out"
 
           if [ -f arch/arm64/boot/Image ]; then
-            echo "CHECK_IMAGE=true" >> $GITHUB_ENV
-            echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> $GITHUB_ENV
+            echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> "$GITHUB_ENV"
           else
             echo "Kernel output file is empty"
             exit 1
@@ -307,7 +288,7 @@ jobs:
           cd AnyKernel3
 
           zip -r "AK3-${{ inputs.LINEAGE_BRANCH }}-OPlus-SM8250_WildKSU_${{ env.KSUVER }}.zip" ./*
-          echo "ZIP_NAME=$(ls *.zip)" >> $GITHUB_ENV
+          echo "ZIP_NAME=$(ls *.zip)" >> "$GITHUB_ENV"
 
       - name: Upload AnyKernel3 ZIP (GitHub Artifact)
         uses: actions/upload-artifact@v4
@@ -327,7 +308,7 @@ jobs:
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/AnyKernel3"
 
-          CAPTION=$'✅ *Kernel Build Success!*\n\n'
+          CAPTION=$'✅ *Kernel Build Success!* \n\n'
           CAPTION+=$'🔸 *Branch:* '"${{ inputs.LINEAGE_BRANCH }}"$'\n'
           CAPTION+=$'🔸 *Kernel Version:* '"${{ env.KERNEL_VERSION }}"$'\n'
           CAPTION+=$'🔸 *KSU Version:* '"${{ env.KSUVER }}"$'\n'
@@ -350,7 +331,7 @@ jobs:
         run: |
           set -euxo pipefail
 
-          MESSAGE=$'❌ *Kernel Build Failed!*\n\n'
+          MESSAGE=$'❌ *Kernel Build Failed!* \n\n'
           MESSAGE+=$'🔸 *Branch:* '"${{ inputs.LINEAGE_BRANCH }}"$'\n'
           MESSAGE+=$'🔸 *Build User:* '"${{ github.actor }}"$'\n'
           MESSAGE+=$'📋 *Logs:* [View Action Run]('"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"$')'
