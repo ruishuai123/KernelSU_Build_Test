@@ -150,6 +150,39 @@ jobs:
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
       # ----------------------------
+      # Fix WildKSU allowlist for kernel 4.19 (TWA_RESUME / put_task_struct)
+      # ----------------------------
+      - name: Patch WildKSU allowlist for kernel 4.19
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+
+          F="drivers/kernelsu/allowlist.c"
+          test -f "$F"
+
+          # Ensure put_task_struct() is declared
+          if ! grep -qE '^\s*#include\s*<linux/sched/task\.h>' "$F"; then
+            if grep -qE '^\s*#include\s*<linux/sched\.h>' "$F"; then
+              sed -i '/^\s*#include\s*<linux\/sched\.h>/a #include <linux/sched/task.h>' "$F"
+            else
+              sed -i '1i #include <linux/sched/task.h>' "$F"
+            fi
+          fi
+
+          # Older kernels may not define TWA_RESUME
+          if ! grep -qE '^\s*#ifndef\s+TWA_RESUME' "$F"; then
+            last_inc_line="$(grep -nE '^\s*#include' "$F" | tail -n 1 | cut -d: -f1 || true)"
+            if [ -n "$last_inc_line" ]; then
+              sed -i "${last_inc_line}a\\\n#ifndef TWA_RESUME\\\n#define TWA_RESUME 0\\\n#endif\\\n" "$F"
+            else
+              sed -i "1i #ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n" "$F"
+            fi
+          fi
+
+          echo "Patched allowlist.c markers:"
+          grep -nE 'sched/task\.h|TWA_RESUME' "$F" || true
+
+      # ----------------------------
       # SUSFS (from your zip) - minimal integration (no big patch apply)
       # ----------------------------
       - name: Integrate SUSFS from zip (minimal)
