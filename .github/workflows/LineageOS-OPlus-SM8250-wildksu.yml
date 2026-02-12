@@ -151,10 +151,7 @@ jobs:
 
           sed -i 's/ -dirty//g' scripts/setlocalversion
 
-      # ----------------------------
-      # ✅ SUSFS (from your zip)
-      # ----------------------------
-      - name: Integrate SUSFS (kernel-4.19 from patches/susfs4ksu-kernel-4.19.zip)
+      - name: Integrate SUSFS (LineageOS-friendly minimal)
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
@@ -165,23 +162,40 @@ jobs:
           mkdir -p /tmp/susfs4ksu
           unzip -q "$SUSFS_ZIP" -d /tmp/susfs4ksu
 
-          # 你的 zip 根目录名（如果以后你换了压缩方式，这里改成实际目录名即可）
-          SUSFS_DIR="/tmp/susfs4ksu/susfs4ksu-kernel-4.19"
+          SUSFS_DIR="$(find /tmp/susfs4ksu -maxdepth 2 -type d -name 'susfs4ksu-kernel-4.19' | head -n 1 || true)"
+          if [ -z "$SUSFS_DIR" ]; then
+            SUSFS_DIR="$(find /tmp/susfs4ksu -maxdepth 2 -type d -name '*susfs*4.19*' | head -n 1 || true)"
+          fi
+          test -n "$SUSFS_DIR"
 
-          # 1) 应用内核补丁（把 susfs 接入 fs/Kconfig/fs/Makefile 等）
-          git apply --whitespace=fix "$SUSFS_DIR/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
-
-          # 2) 放入 SUSFS 本体文件（解决 fs/susfs.c 和 linux/susfs.h 缺失）
+          # 1) 放入 SUSFS 本体文件（解决 fs/susfs.c / linux/susfs.h 缺失）
           install -m 0644 "$SUSFS_DIR/kernel_patches/fs/susfs.c" fs/susfs.c
           install -m 0644 "$SUSFS_DIR/kernel_patches/include/linux/susfs.h" include/linux/susfs.h
           install -m 0644 "$SUSFS_DIR/kernel_patches/include/linux/susfs_def.h" include/linux/susfs_def.h
 
-          # 3) 断言检查（避免跑到 make 才炸）
+          # 2) 让 fs/Makefile 在开启 CONFIG_KSU_SUSFS 时编译 susfs.o（不依赖大 patch）
+          if ! grep -qE 'obj-\$\(CONFIG_KSU_SUSFS\)\s*\+=\s*susfs\.o' fs/Makefile; then
+            echo "" >> fs/Makefile
+            echo "# KernelSU SUSFS" >> fs/Makefile
+            echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
+          fi
+
+          # 3) 适配 LineageOS 的 include/linux/mount.h：把 susfs_mnt_id_backup 塞进 KABI reserve slot
+          #    （你的 vfsmount 是 void *data 在 reserve 前面，原 patch 的上下文对不上，所以这里用替换法）
+          if grep -q 'ANDROID_KABI_RESERVE(4);' include/linux/mount.h && ! grep -q 'susfs_mnt_id_backup' include/linux/mount.h; then
+            perl -0777 -i -pe 's/ANDROID_KABI_RESERVE\(4\);\n/\
+#ifdef CONFIG_KSU_SUSFS\n\tANDROID_KABI_USE(4, u64 susfs_mnt_id_backup);\n#else\n\tANDROID_KABI_RESERVE(4);\n#endif\n#if defined(CONFIG_KSU_SUSFS) \&\& !defined(ANDROID_KABI_RESERVE)\n\tu64 susfs_mnt_id_backup;\n#endif\n/sg' include/linux/mount.h
+          fi
+
+          # 4) 校验关键文件
           test -f fs/susfs.c
           test -f include/linux/susfs.h
           test -f include/linux/susfs_def.h
+          grep -qE 'obj-\$\(CONFIG_KSU_SUSFS\)\s*\+=\s*susfs\.o' fs/Makefile
+          grep -q 'susfs_mnt_id_backup' include/linux/mount.h || true
 
-          echo "✅ SUSFS integrated into kernel tree."
+          echo "✅ SUSFS minimal integration done for LineageOS tree."
+
 
       # ----------------------------
       # ✅ 内核扩展（LSM / NETFILTER / BBR）
